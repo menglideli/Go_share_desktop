@@ -1,0 +1,16 @@
+# 构建产物
+*.exe
+*.dll
+
+# spike 验证产物（截图可能包含屏幕内容，绝不入库）
+spike/**/out/
+spike/**/*.png
+spike/**/*.log
+spike/**/*-out.txt
+spike/**/*-err.txt
+spike/**/rtc-out*.txt
+spike/**/jpeg-out.txt
+spike/**/uiprobe-*
+
+# 本地环境配置
+.env
