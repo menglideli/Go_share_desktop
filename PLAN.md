@@ -364,9 +364,25 @@
 
 **遗留**：向 go264 作者反馈 MF 编码死锁（留一条未来回退 H.264 的路）。
 
-### 阶段 1：采集与预览
-显示器枚举 · 区域框选 · 光标叠加 · DPI 感知 · 本地预览窗
-→ 产出：本地能看到自己的画面，帧率达标
+### 阶段 1：采集与预览 ✅（2026-09-23 完成，受锁屏限制）
+
+| 项 | 实现方式 | 实测结果 |
+|---|---|---|
+| 显示器枚举 | `capture.Displays()`，主屏优先排序 | ✅ 双屏正确，含 DPI/物理/逻辑像素 |
+| 区域裁切 | `cropBGRA` 按 `Stride` 索引 + 并行 | ✅ 与整帧逐像素比对 **0 不一致**（800×600@200,100） |
+| 光标叠加 | Win32 `GetCursorInfo`/`GetIconInfo`/`GetDIBits` 自绘，带句柄缓存 | ✅ 落点与**系统 `DrawIconEx` 绘制完全一致**（包围盒偏差 0） |
+| DPI 感知 | `EnsureDPIAware()` 设 per-monitor aware | ✅ 0 → 2；修复前光标位置会差 1.75 倍 |
+| 本地预览窗 | Gio + `widget.Image{Contain}` + 诊断 HUD | ✅ `CGO_ENABLED=0` 构建，渲染 187 帧，`IsWindowVisible=1` |
+| 热切换区域 | `Source.SetRegion()` | ✅ 生效且不重建后端（无感切换前提） |
+| 最近帧缓存 | `Source.Last()` | ✅ 静止时仍可提供兜底帧（P0-4 心跳） |
+
+复现：`go run ./cmd/capcheck`（自检，9 项）、`go run ./cmd/goshare -exit 8s -log goshare.log`（预览窗）
+
+⚠️ **本次采集性能数据不可信**：验证时机器处于**锁屏界面**，DXGI Duplication 被拒绝
+（`E_ACCESSDENIED`），全部回退 GDI（38.9 ms / 21 fps）。
+**解锁后必须重跑 `capcheck`** 才能得到真实性能（阶段 0 实测 DXGI 为 4.83 ms / 30.7 fps）。
+
+未做（留给阶段 4 完整界面）：鼠标拖拽式的**交互式区域框选**。API 层已就绪（`SetRegion` 验证通过）。
 
 ### 阶段 2：编码与传输
 接入 go264 与 pion · GOP 环形缓存 · 扇出 · 本机两进程打通
@@ -427,6 +443,10 @@ Go_share_desktop/
 | R11 | 拖动窗口频繁触发分辨率重协商 → 卡顿 | **架构上解耦**：窗口变化不改发送分辨率，仅本地 GPU 缩放 |
 | R12 | ~~切屏导致观看端解码器失效~~ | ✅ **阶段 0 已验证** go264 支持原地重配置；MJPEG 本就天然支持 |
 | R13 | 观看端跨 DPI 显示器拖动画面发糊 | 响应 `WM_DPICHANGED` 重算缩放；阶段 1 验证 |
+| **R14** | **锁屏 / UAC 安全桌面 / RDP 断开时 DXGI 被拒** | 实测：`DuplicateOutput` 返回 `E_ACCESSDENIED`，静默回退 GDI（38.9ms/21fps）。库会自动回退不会报错，但性能差 8 倍 → **必须在 HUD 显式显示后端与降级原因**，并在降级时提示用户；触发 `ErrAccessLost` 后需能自动重建 |
+| **R15** | **进程非 DPI aware 导致光标位置差一个 scale** | 高 DPI 屏上 `GetCursorPos` 返回逻辑像素，与物理像素帧差 1.75 倍。**危险之处：错误完全自洽**——自绘位置与 `GetCursorPos` 一致，看不出画错，必须靠「系统自己画的光标」作独立真值才能发现。已用 `EnsureDPIAware()` 修复 |
+| **R16** | Gio 关窗后进程不自行退出 | 实测：`Perform(ActionClose)` 后渲染停止但 `app.Main()` 不返回。自动化场景需兜底 `os.Exit` |
+| **R17** | 采集库 `ShowsCursor` 会强制回退 GDI | 采集 4.8ms → 58.3ms（12 倍）。**代码中已禁用该选项**，光标一律自绘 |
 
 ---
 
@@ -436,14 +456,27 @@ Go_share_desktop/
 - [x] ~~初始化 git 仓库~~ —— 工作区已是仓库（`main` + `origin/main`）
 - [x] 阶段 0 技术验证 —— 8 个 spike 全部跑完，报告见 `VERIFY.md`，选型已锁定
 
-### 下一步（阶段 1 起）
-- [ ] **进入阶段 1：采集与预览** —— 显示器枚举、区域框选、光标叠加（自绘）、本地预览窗
+### 进行中 / 下一步
+- [x] 阶段 1：采集与预览 —— 2026-09-23 完成（自检 9 项通过，预览窗跑通）
+- [ ] **⚠️ 在解锁的普通桌面下重跑 `go run ./cmd/capcheck`** —— 当前采集性能数据因锁屏全部无效（回退 GDI）
+- [ ] 阶段 2：编码与传输 —— MJPEG 条带并行编码 + pion 扇出 + dirty tile
 - [ ] Dirty tile 增量更新设计（直接决定带宽与 CPU，v1 必做）
 - [ ] 向 go264 作者反馈 MF 编码死锁（保留未来回退 H.264 的路）
-- [ ] `.gitignore` 排除 spike 产物（`*.exe`、`out/*.png`、日志）
+- [ ] 交互式区域框选（阶段 4 完整界面时做，API 层 `SetRegion` 已就绪）
 
 ### 阶段 0 遗留的已知约束（写代码时勿忘）
 1. **禁用 `Options.ShowsCursor`** —— 会强制回退 GDI，采集 4.8ms→58.3ms。光标必须自绘。
 2. **索引帧数据时必须用 `Frame.Stride`**，不能假设 `Width*4`（本机恰好相等，换机器不一定）。
 3. **性能测量必须用变化的帧** —— 喂同一帧会让编码器大量 skip，得出过于乐观的数字（本次踩过）。
 4. 构建 `screencapture` 时需 `GOSUMDB=sum.golang.google.cn`（该模块要求 go>=1.26.4，会触发 toolchain 下载，`GOSUMDB=off` 会导致校验失败）。
+
+### 阶段 1 新增的已知约束
+5. **必须先调 `capture.EnsureDPIAware()`**，且要在枚举显示器、创建窗口之前。
+   否则 `GetCursorPos` 返回逻辑像素，光标位置差一个 scale（本机 1.75 倍）。
+6. **锁屏 / UAC 安全桌面 / RDP 断开时 DXGI 会被拒**并静默回退 GDI。
+   性能数据只有在不锁屏时才有意义；产品里要把后端与降级原因显示给用户。
+7. **验证光标落点必须用独立真值**：让系统用 `ShowsCursor=true` 画一次作为参照，
+   不能只比对「自绘位置 vs `GetCursorPos`」——两者可能错得完全自洽。
+8. **Gio 关窗后进程可能不退出**，自动化验证需兜底。
+9. 包内 `cursorMu` 与共享 DC 的锁必须分开（`dc()` 会在持有 `cursorMu` 时被调用，
+   用同一把锁会立刻自锁 —— 本次踩过，表现为进程静默挂起无输出）。

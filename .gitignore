@@ -12,5 +12,10 @@ spike/**/rtc-out*.txt
 spike/**/jpeg-out.txt
 spike/**/uiprobe-*
 
+# 根目录自检/预览产物（含屏幕截图，绝不入库）
+/out/
+*.log
+capcheck-out.txt
+
 # 本地环境配置
 .env
