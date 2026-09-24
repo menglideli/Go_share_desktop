@@ -414,6 +414,28 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 	log.Printf("分享已开始：端口 %d 授权码 %s 地址 %v", srv.Port(), srv.Code(), srv.ShareAddrs())
 	printFirewallHint(srv.Port())
 	a.pushShareState()
+
+	// P0-1 防自摄入：自己的窗口会被自己采集成无限套娃（实测套了 6~7 层），
+	// 每帧都在变 → 全量帧永不停止 → 带宽白烧。分享一开始就把主窗最小化。
+	//
+	// 为什么挪到 goroutine：ShowWindow 会同步派发窗口消息，而这里是 Gio 的按钮回调，
+	// 在事件处理里重入 Gio 的消息循环是自找麻烦。
+	//
+	// 为什么要重试：`-auto share` 模式下 startShare 跑在 shell.Run(ctx) **之前**，
+	// 那一刻 Gio 窗口还没创建，实测报"没找到本进程的可见顶层窗口"。
+	// 交互模式下窗口一定已存在，第一次就成功；重试只是为了同时兼容两种入口，
+	// 顺带也覆盖"窗口正在创建、尚未可见"的中间状态。
+	go func() {
+		for i := 0; i < 20; i++ {
+			time.Sleep(150 * time.Millisecond)
+			if err := ui.MinimizeMainWindow(); err == nil {
+				log.Printf("防自摄入：主窗已最小化（从任务栏点图标可恢复查看状态）")
+				return
+			}
+		}
+		// 失败不影响分享本身，但画面里会多出自己 —— 明确记一笔，别静默。
+		log.Printf("防自摄入：主窗最小化失败（分享不受影响），画面里会看到自己")
+	}()
 	return nil
 }
 

@@ -21,6 +21,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"image"
+	"image/png"
 	"os"
 	"sort"
 	"strconv"
@@ -148,6 +150,8 @@ func main() {
 	noPLI = flag.Bool("nopli", false, "关闭观众侧 PLI 自救（用来单独验证分享端 burst 兜底是否成立）")
 	retry = flag.Int("retry", 1, "接入失败重试次数（真实观众端是 3 次 × 4s）")
 	hardDrop = flag.Bool("hard", false, "-drop 时用硬断开：关 Peer 但不发 Bye，模拟进程被强杀")
+	dumpPath = flag.String("dump-frame", "", "调试：把第 N 帧落盘成 PNG（配合 -dump-at）")
+	dumpAt = flag.Uint64("dump-at", 45, "-dump-frame 指定存第几帧")
 	flag.Parse()
 
 	if *addr == "" || *code == "" {
@@ -227,7 +231,22 @@ var (
 	noPLI    *bool
 	retry    *int
 	hardDrop *bool
+	dumpPath *string
+	dumpAt   *uint64
 )
+
+// saveNRGBA 把一帧落盘。
+//
+// ⚠️ img 指向解码器的复用缓冲（下一帧就把它覆盖掉），所以必须在回调里同步编码完，
+// 不能存指针留着以后再写 —— 那样写出来的是最后那一帧。
+func saveNRGBA(path string, img *image.NRGBA) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return png.Encode(f, img)
+}
 
 func runViewer(ctx context.Context, addr, code string, idx int, stagger, dur time.Duration, dropSec, dropIdx int, v *vstat) {
 	// 错峰：模拟真实场景里观众不是一个一个同时点的，
@@ -339,6 +358,13 @@ func runViewer(ctx context.Context, addr, code string, idx int, stagger, dur tim
 				if fn <= 3 || f.Full {
 					fmt.Printf("  #%d 帧#%d seq=%d 全量=%v 条带 %d/%d %dx%d 非黑 %.1f%% 黑带 %d\n",
 						idx, fn, f.Seq, f.Full, len(f.Tiles), f.TotalTiles, w, h, nb*100, bb)
+				}
+				if *dumpPath != "" && idx == 1 && fn == *dumpAt {
+					if err := saveNRGBA(*dumpPath, img); err != nil {
+						fmt.Printf("  #%d 落盘失败: %v\n", idx, err)
+					} else {
+						fmt.Printf("  #%d 第 %d 帧（%dx%d）已落盘到 %s\n", idx, fn, w, h, *dumpPath)
+					}
 				}
 			},
 		},

@@ -801,3 +801,75 @@ e2e31 时间线（host 日志）：
    `/FI` 被路径转换吃掉，强杀没执行，一整组实验白跑（e2e30 就这么废掉的）。
 5. **压测工具的 `-drop 秒:序号` 是"接通后第 N 秒"**，不是程序启动后第 N 秒。
    给一个还没抢到名额的观众配 `-drop`，它压根没接通，drop 静默不触发，测了个寂寞。
+
+---
+
+## 15. 阶段 5（二）：P0 #1 防自摄入
+
+### 15.1 先证实问题（e2e32）
+
+分享端采**主屏**（`-display 0`），观看端 dump 第 45 帧：
+
+```
+goshare.exe -auto share -port 11200 -code SELF1 -preset 最大 -display 0 -exit 30s -log e2e32-host.log
+goshare.exe -auto watch -addr 127.0.0.1:11200 -code-watch SELF1 \
+            -dump-frame out/selfcapture.png -dump-at 45 -exit 12s
+```
+
+`out/selfcapture.png` 里 **GoShare 窗口套了 6~7 层**（LTSC 17763 没有
+`WDA_EXCLUDEFROMCAPTURE`，拦不住 DXGI 采集自己的窗口）。
+
+危害不只是观感：
+- 每一帧都在变 → **全量帧永远不会停** → 带宽白烧
+- 分享端统计：**82 Mbps 持续**，全量帧 9 → 17 稳定增长
+
+### 15.2 实现
+
+`internal/ui/winmin_windows.go`（新）：
+
+1. `EnumWindows` + `GetWindowThreadProcessId == os.Getpid()` + 可见 + 无 owner → 找到主窗
+2. `ShowWindow(SW_MINIMIZE)` 最小化
+3. 兜底：`SetWindowDisplayAffinity(WDA_MONITOR)` —— 窗口在采集里变黑块
+   （17763 有 `WDA_MONITOR`，只是没有 `WDA_EXCLUDEFROMCAPTURE`）
+4. `internal/ui/winmin_other.go` 提供非 Windows 空实现，保证跨平台能编译到这个包
+
+调用点在 `startShare` 末尾，独立 goroutine 里**有界重试**（20 × 150ms），
+原因见 15.4 的坑 3。
+
+### 15.3 效果（e2e36，同样采主屏）
+
+| | 修复前 e2e32 | 修复后 e2e36 |
+|---|---|---|
+| 带宽（观众 0 人） | **82 Mbps 持续** | 13 → **0.8 Mbps**（降到静止） |
+| 全量帧 | 9 → 17 **持续增长** | **停在 5，之后 460 帧内不再增长** |
+| 编码均值 | 16.4 ms | 13.1 ms |
+
+判据用的是"全量帧是否停止增长"和"静止时带宽是否归零" —— **套娃的签名就是"每帧都在变"**，
+这两条比肉眼看图更硬（本次验证时也确实没依赖看图）。
+
+窗口状态探针（`spike/winenum`）复核：
+
+```
+hwnd=0x1200c08 pid=9868  可见=true  最小化=true  owner=0x0 标题="GoShare · 内网桌面共享"
+```
+
+### 15.4 实现过程中踩的三个坑（详见 PLAN 约束 42~44）
+
+1. **`IsWindowVisible` 判断不了最小化**：最小化的窗口仍带 `WS_VISIBLE`，探针显示
+   "可见=true 最小化=true"。判据必须是 `IsIconic`；`ShowWindow` 的返回值也只是
+   "调用**前**是否可见"，返回 0 不等于失败。
+2. **裸 syscall 传 `&pid` 拿不到值**：`proc.Call(hwnd, uintptr(unsafe.Pointer(&pid)))` 里
+   pid 恒为 0 → 每个窗口都被判成"别的进程"→ 报"没找到本进程的可见顶层窗口"，
+   而窗口明明在屏幕上。改用 `windows.GetWindowThreadProcessId` 封装后立刻正常。
+   （定位手段：写了 `spike/winenum` 探针把本进程所有顶层窗口的 pid/可见/owner/标题全打出来，
+   一眼看出窗口存在且符合条件，问题只能在"取 pid"这一步。）
+3. **`-auto share` 下窗口还不存在**：`startShare` 跑在 `shell.Run(ctx)` 之前，
+   所以自动模式必然找不到窗口（日志实测"最小化失败"）。加了有界重试同时兼容两种入口。
+
+### 15.5 残留
+
+- 现在是**任务栏最小化**，不是真托盘：恢复要点任务栏图标。托盘图标（`Shell_NotifyIcon`
+  + 自建消息窗口）更利于后台常驻，列入待办。
+- 主屏采集的验证永远有自摄入残余风险：**验证过程中自己弹的控制台窗口也会进画面**
+  （e2e37 的全量帧就从 3 涨到 42，因为那段时间我在跑探针和读日志）。
+  结论：这类验证优先采副屏，或用无窗口工具。
