@@ -22,9 +22,18 @@ type Frame struct {
 	H   int
 	Seq uint64
 	TS  time.Time
-	// CaptureMs 是底层采集一帧的耗时（库内部统计口径之外的一次实测），
-	// 用于诊断 HUD，不影响数据正确性。
+	// CaptureMs 是采集一帧的总耗时（WaitMs + ProcMs），保留兼容旧调用方。
 	CaptureMs float64
+	// WaitMs 是阻塞等待桌面产生变化的时间。
+	//
+	// ⚠️ 千万别把它当"采集开销"：DXGI Duplication 是**变化驱动**的，
+	// 桌面静止时 WaitFrame 会一直阻塞（实测静止 2s 只出 1 帧），
+	// 此时 WaitMs 可以高达数百毫秒，但 CPU 实际是空闲的。
+	// 真正的 CPU 开销看 ProcMs。
+	WaitMs float64
+	// ProcMs 是拿到原始帧之后的处理耗时：区域裁切 + 光标叠加。
+	// 这才是能计入 CPU 预算的数字。
+	ProcMs float64
 }
 
 // Empty 报告该帧是否无有效数据。
@@ -51,14 +60,20 @@ type Options struct {
 
 // Source 是一个采集会话。非并发安全：同一时刻只能有一个 goroutine 取帧。
 type Source struct {
-	opt     Options
-	stream  *screencapture.Stream
-	region  Rect
-	buf     []byte
+	opt    Options
+	stream *screencapture.Stream
+	region Rect
+	// bufs 是双缓冲：本帧写 bufs[idx]，上一帧的内容留在 bufs[1-idx]。
+	// 这样 Last() 可直接引用上一块，省掉每帧一次整帧深拷贝
+	//（2K 整屏 20MB，实测是笔不小的开销）。
+	bufs    [2][]byte
+	idx     int
 	last    Frame
 	frames  uint64
 	draws   uint64
 	capture time.Duration
+	wait    time.Duration
+	proc    time.Duration
 	started time.Time
 }
 
@@ -78,7 +93,7 @@ func NewSource(ctx context.Context, opt Options) (*Source, error) {
 		opt:     opt,
 		stream:  st,
 		region:  region,
-		buf:     make([]byte, region.W*region.H*4),
+		bufs:    [2][]byte{make([]byte, region.W*region.H*4), make([]byte, region.W*region.H*4)},
 		started: time.Now(),
 	}
 	return s, nil
@@ -94,8 +109,11 @@ func (s *Source) Region() Rect { return s.region }
 // 若新区域尺寸与旧区域不同，缓冲区会在下一帧自动重新分配。
 func (s *Source) SetRegion(r Rect) {
 	s.region = r.Clamp(s.opt.Display)
-	if cap(s.buf) < s.region.W*s.region.H*4 {
-		s.buf = make([]byte, s.region.W*s.region.H*4)
+	n := s.region.W * s.region.H * 4
+	for i := range s.bufs {
+		if cap(s.bufs[i]) < n {
+			s.bufs[i] = make([]byte, n)
+		}
 	}
 }
 
@@ -113,11 +131,16 @@ func (s *Source) Close() error { return s.stream.Close() }
 
 // Stats 是采集侧的运行时统计。
 type Stats struct {
-	Frames    uint64
+	Frames      uint64
 	CursorDraws uint64
-	FPS       float64
+	FPS         float64
+	// MeanCapture 是总耗时均值（等待 + 处理）。桌面静止时会虚高，别当 CPU 开销看。
 	MeanCapture time.Duration
-	Backend   string
+	// MeanWait 是阻塞等待桌面变化的均值（CPU 空闲时间）。
+	MeanWait time.Duration
+	// MeanProc 是取帧后处理（裁切 + 光标）的均值，这是真实 CPU 开销。
+	MeanProc time.Duration
+	Backend  string
 }
 
 // Stats 返回当前统计。
@@ -127,15 +150,20 @@ func (s *Source) Stats() Stats {
 	if el > 0 {
 		fps = float64(s.frames) / el
 	}
-	mean := time.Duration(0)
+	mean, mw, mp := time.Duration(0), time.Duration(0), time.Duration(0)
 	if s.frames > 0 {
-		mean = s.capture / time.Duration(s.frames)
+		d := time.Duration(s.frames)
+		mean = s.capture / d
+		mw = s.wait / d
+		mp = s.proc / d
 	}
 	return Stats{
 		Frames:      s.frames,
 		CursorDraws: s.draws,
 		FPS:         fps,
 		MeanCapture: mean,
+		MeanWait:    mw,
+		MeanProc:    mp,
 		Backend:     s.stream.Backend().String(),
 	}
 }
@@ -149,13 +177,14 @@ func (s *Source) Last() Frame { return s.last }
 func (s *Source) WaitFrame(ctx context.Context) (Frame, error) {
 	t0 := time.Now()
 	f, err := s.stream.WaitFrame(ctx)
-	capture := time.Since(t0)
+	waited := time.Since(t0) // 阻塞等待，CPU 空闲
 	if err != nil {
 		return Frame{}, err
 	}
 	if !f.Valid() {
 		return Frame{}, errNoFrame
 	}
+	tp := time.Now() // 开始真正的 CPU 处理
 	// 分辨率中途变化（换屏/改分辨率）时重新 clamp 区域
 	region := s.region
 	if f.Width != s.opt.Display.W || f.Height != s.opt.Display.H {
@@ -167,20 +196,22 @@ func (s *Source) WaitFrame(ctx context.Context) (Frame, error) {
 	if region.Empty() {
 		return Frame{}, errNoFrame
 	}
-	if cap(s.buf) < region.W*region.H*4 {
-		s.buf = make([]byte, region.W*region.H*4)
+	n := region.W * region.H * 4
+	idx := s.idx
+	if cap(s.bufs[idx]) < n {
+		s.bufs[idx] = make([]byte, n)
 	}
-	buf := s.buf[:region.W*region.H*4]
+	buf := s.bufs[idx][:n]
+	s.idx = 1 - idx // 下一帧写另一块，本块得以保留给 Last()
 
 	cropBGRA(buf, f.Pix, f.Stride, region.X, region.Y, region.W, region.H)
 
 	out := Frame{
-		Pix:       buf,
-		W:         region.W,
-		H:         region.H,
-		Seq:       f.Seq,
-		TS:        time.Now(),
-		CaptureMs: float64(capture.Microseconds()) / 1000.0,
+		Pix: buf,
+		W:   region.W,
+		H:   region.H,
+		Seq: f.Seq,
+		TS:  time.Now(),
 	}
 
 	if s.opt.Cursor {
@@ -191,10 +222,18 @@ func (s *Source) WaitFrame(ctx context.Context) (Frame, error) {
 		s.draws++
 	}
 
+	processed := time.Since(tp)
+	capture := time.Since(t0)
+	out.WaitMs = float64(waited.Microseconds()) / 1000.0
+	out.ProcMs = float64(processed.Microseconds()) / 1000.0
+	out.CaptureMs = float64(capture.Microseconds()) / 1000.0
+
 	s.frames++
 	s.capture += capture
-	// 保留最近一帧（拷贝，因为 buf 会被下一帧复用）
-	s.last = out.Clone()
+	s.wait += waited
+	s.proc += processed
+	// 心跳兜底（P0-4）：直接引用刚写完的这块缓冲，下一帧会写另一块。
+	s.last = out
 	s.region = region
 	return out, nil
 }

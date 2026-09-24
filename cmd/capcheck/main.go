@@ -222,7 +222,7 @@ func checkPerf(ctx context.Context, d capture.Display) {
 			}
 		}()
 		n := 0
-		captureMs := 0.0
+		waitMs, procMs := 0.0, 0.0
 		deadline := time.Now().Add(3 * time.Second)
 		for time.Now().Before(deadline) {
 			f2, cancel := context.WithTimeout(ctx, 120*time.Millisecond)
@@ -230,19 +230,24 @@ func checkPerf(ctx context.Context, d capture.Display) {
 			cancel()
 			if err == nil && !f.Empty() {
 				n++
-				captureMs += f.CaptureMs
+				waitMs += f.WaitMs
+				procMs += f.ProcMs
 			}
 		}
 		close(done)
 		fps := float64(n) / 3.0
-		mean := 0.0
+		mw, mp := 0.0, 0.0
 		if n > 0 {
-			mean = captureMs / float64(n)
+			mw = waitMs / float64(n)
+			mp = procMs / float64(n)
 		}
 		st := src.Stats()
-		check(label, fps >= 25,
-			fmt.Sprintf("%.1f fps · 采集均值 %.2f ms · 后端 %s%s",
-				fps, mean, st.Backend, noteSuffix(src.Note())))
+		// ⚠️ 判定口径：fps 与等待时长取决于"桌面变化有多频繁"，不是采集能力。
+		// DXGI 是变化驱动的，桌面静止时可以低到 0.5fps —— 那是预期行为。
+		// 真正衡量采集开销的是 ProcMs（裁切+光标的 CPU 时间）。
+		check(label, mp < 12,
+			fmt.Sprintf("%.1f fps · 等待 %.1f ms · 处理 %.2f ms · 后端 %s%s",
+				fps, mw, mp, st.Backend, noteSuffix(src.Note())))
 	}
 	run("整屏采集", capture.Rect{})
 	run("区域采集 1280x720", capture.Rect{X: 100, Y: 100, W: 1280, H: 720})

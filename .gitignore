@@ -17,5 +17,12 @@ spike/**/uiprobe-*
 *.log
 capcheck-out.txt
 
+# 自检/演示输出（含屏幕相关内容，一律不入库）
+*.log
+codeccheck-out.txt
+netcheck-out.txt
+capcheck-out.txt
+out/
+
 # 本地环境配置
 .env
