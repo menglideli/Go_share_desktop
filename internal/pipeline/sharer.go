@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"goshare/internal/capture"
@@ -101,6 +102,16 @@ type Sharer struct {
 	stats Stats
 	// wantKey 表示下一位观众（或全部观众）需要全量帧
 	wantKey bool
+	// paused 为 true 时不再发送真实画面，改发纯黑帧（见 SetPaused）。
+	paused bool
+	// blackStreak 是连续"全黑采样"的次数，用来识别"采集源其实取不到画面"
+	// （锁屏 / UAC 安全桌面 / 采集后端异常）。见 BlackScreen。
+	blackStreak atomic.Int32
+	// sampleTick 控制抽样频率（每帧都统计太浪费）。
+	sampleTick int
+	// black 是暂停用的纯黑 BGRA 缓冲，尺寸变化时重建。
+	// 只有 Run 那个 goroutine 会碰它，不需要锁。
+	black []byte
 }
 
 // NewSharer 启动采集并创建分享管线。
@@ -166,12 +177,116 @@ func (s *Sharer) PeerCount() int {
 // RequestKeyFrame 请求下一个编码帧为全量帧（观众丢片后恢复用）。
 func (s *Sharer) RequestKeyFrame() { s.enc.ForceKeyFrame() }
 
+// Preset 返回当前档位（界面显示用）。
+func (s *Sharer) Preset() Preset {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg.Preset
+}
+
 // SetPreset 切换质量档位。会触发一次全量帧。
 func (s *Sharer) SetPreset(p Preset) {
 	s.mu.Lock()
 	s.cfg.Preset = p
 	s.mu.Unlock()
 	s.enc.ForceKeyFrame()
+}
+
+// pauseInterval 是暂停期间发送纯黑帧的间隔。
+//
+// 为什么暂停要发黑帧而不是干脆不发包：观众看到的"画面停住不动"和
+// "连接断了"长得一模一样，他无法区分。发一帧全黑是明确的信号。
+const pauseInterval = time.Second
+
+// 全黑判定参数。抽样间隔取 15 帧、连续 4 次判定，意味着 ~60 帧（约 2 秒）
+// 的全黑才认定 —— 足够避开一两次瞬时的黑帧（例如应用全屏切换），
+// 又能在锁屏这类持续状态上很快反应过来。
+const (
+	blackSampleEvery = 15
+	blackStreakLimit = 4
+)
+
+// BlackScreen 报告采集源是否疑似取不到画面（持续全黑）。
+//
+// 实测场景：会话锁屏后 DXGI Duplication 取不到内容，回退 GDI 也抓不到
+// 安全桌面，于是每一帧都是黑的 —— 此时观众看到的是一片黑，带宽接近 0。
+// 不检测的话用户只能对着黑屏猜（"是我设置错了？还是断线了？"）。
+func (s *Sharer) BlackScreen() bool {
+	return s.blackStreak.Load() >= blackStreakLimit
+}
+
+// sampleBlack 抽样判断一帧是否几乎全黑，并维护连续计数。
+func (s *Sharer) sampleBlack(f capture.Frame) {
+	s.sampleTick++
+	if s.sampleTick < blackSampleEvery {
+		return
+	}
+	s.sampleTick = 0
+	if f.Empty() {
+		return
+	}
+	// 大步长抽样：只为判断"是不是全黑"，不需要精确统计
+	step := 8
+	n, nb := 0, 0
+	for y := 0; y < f.H; y += step {
+		row := y * f.W * 4
+		for x := 0; x < f.W; x += step {
+			i := row + x*4
+			if i+2 >= len(f.Pix) {
+				break
+			}
+			lum := (77*int(f.Pix[i+2]) + 150*int(f.Pix[i+1]) + 29*int(f.Pix[i])) >> 8
+			if lum > 8 {
+				nb++
+			}
+			n++
+		}
+	}
+	if n == 0 {
+		return
+	}
+	if float64(nb)/float64(n) < 0.002 {
+		s.blackStreak.Add(1)
+	} else {
+		s.blackStreak.Store(0)
+	}
+}
+
+// Paused 报告当前是否处于暂停。
+func (s *Sharer) Paused() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.paused
+}
+
+// SetPaused 暂停/恢复画面推送。暂停期间观众看到纯黑画面。
+//
+// 恢复时会强制一次全量帧 —— MJPEG 每帧独立，但 dirty tile 增量会让观众
+// 只收到变化区域，缺了全量帧就会一直看到上一帧的残影。
+func (s *Sharer) SetPaused(on bool) {
+	s.mu.Lock()
+	s.paused = on
+	s.mu.Unlock()
+	if !on {
+		s.enc.ForceKeyFrame()
+	}
+}
+
+// blackFrame 返回一帧纯黑画面（按当前采集区域尺寸）。
+func (s *Sharer) blackFrame() capture.Frame {
+	r := s.src.Region()
+	n := r.W * r.H * 4
+	if n <= 0 {
+		return capture.Frame{}
+	}
+	if len(s.black) != n {
+		s.black = make([]byte, n)
+		// BGRA：只有 alpha 需要置 255，其余保持 0 就是纯黑不透明
+		for i := 3; i < n; i += 4 {
+			s.black[i] = 255
+		}
+	}
+	return capture.Frame{Pix: s.black, W: r.W, H: r.H, TS: time.Now()}
 }
 
 // Stats 返回统计快照。
@@ -201,10 +316,25 @@ func (s *Sharer) Run(ctx context.Context) error {
 	}
 	lastSend := time.Time{}
 	lastBeat := time.Now()
+	lastPauseEmit := time.Time{}
 
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if s.Paused() {
+			// 暂停期间不检测黑屏：黑帧是自己发的，与采集是否可用无关。
+			s.blackStreak.Store(0)
+			// 暂停：低频发一帧纯黑，明确告诉观众"被暂停了"而不是"卡住了"。
+			if time.Since(lastPauseEmit) >= pauseInterval {
+				_ = s.emit(s.blackFrame())
+				lastPauseEmit = time.Now()
+			}
+			// 仍要用带超时的等待，否则 ctx 取消要等到下一次桌面变化才响应。
+			c, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+			_, _ = s.src.WaitFrame(c)
+			cancel()
+			continue
 		}
 		f, err := s.src.WaitFrame(ctx)
 		if err != nil {
@@ -224,6 +354,8 @@ func (s *Sharer) Run(ctx context.Context) error {
 			continue
 		}
 		lastBeat = time.Now()
+		// 只在真实采集帧上检测：暂停期间我们本来就发黑帧，不能算"取不到画面"。
+		s.sampleBlack(f)
 
 		// 帧率上限：限帧在编码之前，省掉不必要的 CPU。
 		//

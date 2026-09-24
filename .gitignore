@@ -24,5 +24,9 @@ netcheck-out.txt
 capcheck-out.txt
 out/
 
+# uicheck 运行输出（基线在 testdata/ui-golden，需入库）
+uicheck-out.txt
+uicheck-mutate.txt
+
 # 本地环境配置
 .env
