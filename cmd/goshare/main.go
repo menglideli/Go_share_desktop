@@ -9,10 +9,12 @@ import (
 	"flag"
 	"fmt"
 	"image"
+	"image/png"
 	"log"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -44,6 +46,14 @@ func main() {
 	autoPreset := flag.String("preset", "最大", "-auto share 时的质量档位")
 	autopause := flag.Duration("autopause", 0, "自动分享后多久暂停（验证暂停链路用，0 = 不暂停）")
 	displayIdx := flag.Int("display", -1, "采集哪块显示器（-1 = 主屏）")
+	// 诊断用：观看端把第 N 帧原样落盘，用来回答"观众到底收到了什么"。
+	// 光看 fps/带宽/非黑占比无法区分"网络问题"和"画面本身就是暗的"。
+	dumpFrame := flag.String("dump-frame", "", "调试：观看端收到第 N 帧时存 PNG（配合 -dump-at）")
+	dumpAt := flag.Uint64("dump-at", 40, "-dump-frame 指定存第几帧")
+	// 既是为了逐条验证恢复路径（关掉某条路，看画面还能不能自愈），
+	// 也是产品上的调优旋钮。
+	keyInterval := flag.Duration("key-interval", 0, "稳态周期性全量帧间隔（0/负值=禁用，靠观众请求恢复）")
+	keyBurst := flag.Duration("key-burst", 3*time.Second, "新观众接入后的密集补帧窗口（负值禁用）")
 	flag.Parse()
 
 	if *logPath != "" {
@@ -74,7 +84,11 @@ func main() {
 		names = append(names, p.Name)
 	}
 
-	a := &app{ctx: ctx, port: *port, maxViewers: *maxViewers, fixedCode: *code}
+	a := &app{
+		ctx: ctx, port: *port, maxViewers: *maxViewers, fixedCode: *code,
+		dumpPath: *dumpFrame, dumpAt: *dumpAt,
+		keyInterval: *keyInterval, keyBurst: *keyBurst,
+	}
 	a.shell = ui.NewShell(ui.ShellConfig{
 		Title:    "GoShare · 内网桌面共享",
 		Displays: ds,
@@ -162,6 +176,53 @@ type app struct {
 
 	// blackWarned 记录"全黑"告警是否已上报，避免每 500ms 刷屏。
 	blackWarned bool
+	// hudTicks 统计 HUD 刷新次数，用来把日志降频到每 3 秒一条。
+	hudTicks int
+
+	// dumpPath / dumpAt：诊断用，把观看端收到的第 N 帧原样落盘。
+	dumpPath string
+	dumpAt   uint64
+	// keyInterval / keyBurst：全量帧补帧策略（见 -key-interval / -key-burst）。
+	keyInterval time.Duration
+	keyBurst    time.Duration
+
+	// ---- 观看端画面完整性（R32）----
+	// needFull：当前画布不完整，需要一帧全量。初始为 true —— 观众在收到
+	// 第一帧全量之前，画布上什么都没有，这是"开局大片黑"的根因。
+	needFull atomic.Bool
+	// lastPLI 是上次请求全量帧的时刻（UnixNano），用于限流。
+	lastPLI atomic.Int64
+	// lastFrag 是上次观察到的重组丢帧计数，用来发现"悄悄丢了分片"。
+	lastFrag atomic.Uint64
+	// peerBox 让 OnFrame 回调能拿到 peer（它要等 Dial 返回后才存在）。
+	peerBox atomic.Pointer[rtc.Peer]
+
+	// pliTarget 记录本次接入的 peer，供状态循环重试请求。
+	pliTarget *rtc.Peer
+}
+
+// pliMinInterval 是请求全量帧的最小间隔。
+//
+// 不能太密：每次请求都会让编码器放弃 dirty 增量、重编一整帧，
+// 请求过密反而互相打断，把恢复拖慢。
+const pliMinInterval = 300 * time.Millisecond
+
+// sendPLI 请分享端尽快发一帧全量（走可靠有序的 ctl 通道）。
+func (a *app) sendPLI(p *rtc.Peer) {
+	if p == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := a.lastPLI.Load()
+	if last != 0 && now-last < int64(pliMinInterval) {
+		return
+	}
+	if !a.lastPLI.CompareAndSwap(last, now) {
+		return
+	}
+	if err := p.SendControl(rtc.CtlPLI, nil); err != nil {
+		log.Printf("请求全量帧失败: %v", err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +246,9 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 		Region:  opts.Region,
 		Preset:  pipeline.PresetByName(opts.Preset),
 		Cursor:  true,
+		// 全量帧补帧策略（R32）：接入窗口内密集补 + 稳态靠观众请求。
+		KeyBurst:    a.keyBurst,
+		KeyInterval: a.keyInterval,
 		OnFrame: func(f *codec.Frame, src capture.Frame) {
 			a.mu.Lock()
 			v := a.view
@@ -264,6 +328,15 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 					}()
 				}
 			},
+			// 观众端发现自己没有完整画面时会发 PLI（R32）。
+			// 这条请求走的是可靠有序的 ctl 通道，比 media 通道可靠得多，
+			// 是观众侧唯一能主动自救的手段。
+			OnControl: func(t rtc.CtlType, payload []byte) {
+				if t == rtc.CtlPLI {
+					log.Printf("观众 %s 请求全量帧", req.RemoteIP)
+					sh.RequestKeyFrame()
+				}
+			},
 		})
 		if err != nil {
 			return webrtc.SessionDescription{}, nil, err
@@ -288,6 +361,18 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 		// non-trickle：等候选收齐，answer 里才带得上 UDP 端口
 		peer.WaitGathering(3 * time.Second)
 		sh.AddPeer(peer)
+		// AddPeer 里的 ForceKeyFrame 只是置标志，真正的全量帧要到下一帧编码
+		// （~33ms 后）才产生。那一刻 DataChannel 往往还没 open（DTLS 握手未完成），
+		// SendFrame 直接返回 ErrNotOpen 把这一帧丢掉 —— 而编码器已经把
+		// havePrev 置为 true，全量帧只此一次，观众端于是**永远**缺初始画面：
+		// 实测开局只拿到 11.8% 的内容，全靠桌面大幅变化偶然触发全量才补全（R32）。
+		// 通道就绪后再补一次请求，才算稳。
+		go func() {
+			if err := peer.WaitReady(15 * time.Second); err != nil {
+				return
+			}
+			sh.RequestKeyFrame()
+		}()
 		log.Printf("观众 %s（%s）已接入，当前 %d 人", req.Viewer, req.RemoteIP, sh.PeerCount())
 		return *peer.PC().LocalDescription(), func() { cleanup("正常断开") }, nil
 	})
@@ -386,8 +471,12 @@ func (a *app) pushShareState() {
 		regionText = fmt.Sprintf("区域 %d×%d", r.W, r.H)
 	}
 
+	// Stats.EncodeMs 在 Stats() 里已经折算成**均值**（见 pipeline.Sharer.Stats），
+	// 拿到手就是"每帧编码耗时"，不要再除一次帧数 —— 除两次会显示成 0.0 ms。
+	encAvg := st.EncodeMs
+
 	hud := fmt.Sprintf("发送 %.1f fps · %.1f Mbps\n编码 %.1f ms · 采集 %s\n已发 %d 帧 · 观众 %d 人\n共享 %s",
-		fps, mbps, st.EncodeMs, st.Backend, st.Frames, len(rows), regionText)
+		fps, mbps, encAvg, st.Backend, st.Frames, len(rows), regionText)
 
 	// 采集源取不到画面（锁屏 / 安全桌面 / 后端异常）时明确说出来。
 	// 不提示的话，用户看到的只是"一片黑"，无法区分是自己设置错了还是断线了。
@@ -406,6 +495,17 @@ func (a *app) pushShareState() {
 		} else {
 			log.Printf("采集画面已恢复正常")
 		}
+	}
+
+	// 每 3 秒一条分享端统计。**全量帧占比**是关键指标：增量帧只发变化条带，
+	// 全量帧发整帧，两者带宽差一个数量级 —— 带宽异常时先看这个比例。
+	a.mu.Lock()
+	a.hudTicks++
+	tick := a.hudTicks
+	a.mu.Unlock()
+	if tick%6 == 0 {
+		log.Printf("分享统计：%.1f fps · %.1f Mbps · 编码均值 %.1f ms · 全量帧 %d/%d · 观众 %d 人",
+			fps, mbps, encAvg, st.Keys, st.Frames, len(rows))
 	}
 
 	a.shell.SetShareState(ui.ShareState{
@@ -551,6 +651,10 @@ func (a *app) join(addr, code string) {
 		a.mu.Lock()
 		a.wFrames, a.wBytes, a.wStart, a.wDec = 0, 0, time.Now(), 0
 		a.mu.Unlock()
+		// 新接入 = 画布从零开始：在收到第一帧全量之前，画布上什么都还没有（R32）。
+		a.needFull.Store(true)
+		a.lastFrag.Store(0)
+		a.peerBox.Store(nil)
 
 		dec := codec.NewDecoder(0)
 		var sess *signal.Session
@@ -626,14 +730,44 @@ func (a *app) dialOnce(dec *codec.Decoder, addr, code string) (*signal.Session, 
 					a.wBytes += uint64(f.Bytes)
 					a.wDec = dec.DecodeMs
 					a.wNonBlack, a.wLum = nb, lum
+					n := a.wFrames
+					path := a.dumpPath
+					at := a.dumpAt
 					a.mu.Unlock()
+					// 画面完整性（R32）：只有全量帧才能把画布填满，增量帧
+					// 只更新"变化过的"条带。没拿到全量就立刻请对方补一帧，
+					// 不能指望桌面碰巧大幅变化去触发（实测等了 12 秒）。
+					if f.Full {
+						a.needFull.Store(false)
+					} else if a.needFull.Load() {
+						a.sendPLI(a.peerBox.Load())
+					}
+					// 前几帧与每次全量帧都记一笔：用来回答"观众拿到的是不是
+					// 从完整画面开始" —— 增量帧只能更新变化区域，缺了初始全量帧，
+					// 静止区域就永远是黑的（实测踩过）。
+					if n <= 5 || f.Full {
+						log.Printf("收到帧 #%d seq=%d 全量=%v 条带 %d/%d %dx%d 非黑 %.1f%%",
+							n, f.Seq, f.Full, len(f.Tiles), f.TotalTiles, f.W, f.H, nb*100)
+					}
+					if path != "" && n == at {
+						log.Printf("诊断：把观看端第 %d 帧（%dx%d）落到 %s",
+							n, img.Bounds().Dx(), img.Bounds().Dy(), path)
+						if err := savePNG(path, img); err != nil {
+							log.Printf("诊断：落盘失败: %v", err)
+						}
+					}
 					// 直接给界面新画布：解码器内部缓冲会被下一帧覆盖，
 					// 与渲染线程共用同一块内存会直接崩（阶段 2 踩过）。
 					a.shell.PushFrame(copyNRGBA(img))
 				},
 			},
 	})
-	return sess, err
+	if err != nil {
+		return nil, err
+	}
+	// Dial 内部才创建 peer，回调里拿不到，只能先装箱再交给 OnFrame。
+	a.peerBox.Store(sess.Peer)
+	return sess, nil
 }
 
 func (a *app) watchStatusLoop() {
@@ -664,10 +798,23 @@ func (a *app) watchStatusLoop() {
 		nb, lum, fr := a.wNonBlack, a.wLum, a.wFrames
 		a.mu.Unlock()
 		a.shell.SetJoinState(ui.JoinState{Status: st})
+		ps := sess.Peer.Stats()
+		// 丢分片 = 画布上少了一块，而且少的那块不会自己回来（增量帧只覆盖
+		// 变化区域）→ 立刻请全量。sendPLI 自带 300ms 限流，持续丢就是持续重试。
+		if prev := a.lastFrag.Swap(ps.FragLost); ps.FragLost > prev {
+			log.Printf("检测到分片丢失（累计 %d 帧），请求全量帧", ps.FragLost)
+			a.needFull.Store(true)
+		}
+		if a.needFull.Load() {
+			a.sendPLI(sess.Peer)
+		}
 		ticks++
 		if ticks%6 == 0 {
-			// 每 3s 一条：非黑占比是"画面真的到了"的像素级证据
-			log.Printf("观看统计：%s · 非黑 %.1f%% · 亮度 %.1f · 已收 %d 帧", st, nb*100, lum, fr)
+			// 每 3s 一条：非黑占比是"画面真的到了"的像素级证据。
+			// 碎片丢（FragLost）单列 —— 它是"画面缺一块"的直接嫌疑：
+			// 一个全量帧有上百个分片，丢 1 片整帧就废，而观众端不会自动补。
+			log.Printf("观看统计：%s · 非黑 %.1f%% · 亮度 %.1f · 已收 %d 帧 · 重组丢帧 %d",
+				st, nb*100, lum, fr, ps.FragLost)
 		}
 	}
 }
@@ -754,6 +901,16 @@ func copyNRGBA(src *image.NRGBA) *image.NRGBA {
 	dst := image.NewNRGBA(src.Bounds())
 	copy(dst.Pix, src.Pix)
 	return dst
+}
+
+// savePNG 把一帧原样落盘（诊断用）。
+func savePNG(path string, img image.Image) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return png.Encode(f, img)
 }
 
 // fitScale 计算把桌面缩到界面显示区（约 960×540）所需的整数降采样倍率。

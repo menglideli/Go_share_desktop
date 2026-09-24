@@ -67,6 +67,23 @@ type Config struct {
 	Warmup time.Duration
 	// IdleHeartbeat 是桌面静止时的保活间隔。0 表示用默认 2s。
 	IdleHeartbeat time.Duration
+	// KeyBurst 是"新观众接入后密集补全量帧"的窗口时长（R32）。
+	//
+	// 为什么需要：增量帧只能更新"变化过的"条带。观众若在接入那一刻丢掉了
+	// 那个唯一的全量帧（通道尚未就绪 / 分片丢失），静止区域就**永远是黑的**，
+	// 而且不会再有任何机制去补 —— 实测观众开局只能拿到 11.8% 的画面，
+	// 靠桌面恰好大幅变化才偶然补全（等了 12 秒 / 226 帧）。
+	// 接入后这段时间内按 KeyBurstGap 反复补全量，把"开局必然完整"变成确定性。
+	// 0 表示用默认 3s；负数表示禁用。
+	KeyBurst time.Duration
+	// KeyBurstGap 是补帧窗口内的全量帧间隔。0 表示用默认 400ms。
+	KeyBurstGap time.Duration
+	// KeyInterval 是**稳态**下周期性全量帧的间隔（兜底自愈）。
+	//
+	// 默认 0（禁用）：稳态靠观众端"发现画面不完整 → 请求全量"（CtlPLI）来修，
+	// 不必持续付出全量帧的带宽。实测开启 3s 稳态周期会让带宽从 5.5 涨到
+	// 9.2 Mbps（+67%），代价明显。负数同样表示禁用。
+	KeyInterval time.Duration
 	// OnFrame 每编码完一帧回调（诊断/预览用），可为 nil。
 	OnFrame func(f *codec.Frame, src capture.Frame)
 }
@@ -74,6 +91,12 @@ type Config struct {
 func (c Config) withDefaults() Config {
 	if c.FPS <= 0 {
 		c.FPS = 30
+	}
+	if c.KeyBurst == 0 {
+		c.KeyBurst = 3 * time.Second
+	}
+	if c.KeyBurstGap == 0 {
+		c.KeyBurstGap = 400 * time.Millisecond
 	}
 	if c.IdleHeartbeat <= 0 {
 		c.IdleHeartbeat = 2 * time.Second
@@ -87,6 +110,7 @@ type Stats struct {
 	Bytes     uint64
 	DropIdle  uint64 // 因帧率限制跳过的帧
 	Heartbeat uint64
+	Keys      uint64 // 全量帧数（含接入/切换档位/周期兜底）
 	EncodeMs  float64 // 均值
 	capture.Stats
 }
@@ -112,6 +136,10 @@ type Sharer struct {
 	// black 是暂停用的纯黑 BGRA 缓冲，尺寸变化时重建。
 	// 只有 Run 那个 goroutine 会碰它，不需要锁。
 	black []byte
+	// lastKeyAt 是上一次"全量帧"发出（编码）的时刻。
+	lastKeyAt time.Time
+	// keyUntil 是"补帧窗口"的截止时刻（新观众接入时开启，R32）。
+	keyUntil time.Time
 }
 
 // NewSharer 启动采集并创建分享管线。
@@ -132,10 +160,11 @@ func NewSharer(ctx context.Context, cfg Config) (*Sharer, error) {
 		_, _ = src.Warmup(ctx, 3, cfg.Warmup)
 	}
 	return &Sharer{
-		cfg:   cfg,
-		src:   src,
-		enc:   codec.NewEncoder(codec.Config{Quality: cfg.Preset.Quality, Tiles: cfg.Preset.Tiles, Dirty: cfg.Preset.Dirty}),
-		peers: map[*rtc.Peer]struct{}{},
+		cfg:       cfg,
+		src:       src,
+		enc:       codec.NewEncoder(codec.Config{Quality: cfg.Preset.Quality, Tiles: cfg.Preset.Tiles, Dirty: cfg.Preset.Dirty}),
+		peers:     map[*rtc.Peer]struct{}{},
+		lastKeyAt: time.Now(),
 	}, nil
 }
 
@@ -156,6 +185,11 @@ func (s *Sharer) AddPeer(p *rtc.Peer) {
 	s.mu.Lock()
 	s.peers[p] = struct{}{}
 	s.wantKey = true
+	// 开启补帧窗口：新观众要的是"尽快看到完整画面"，而不是"恰好发过一次
+	// 全量帧"（那一次很可能撞在通道未就绪上，见 R32）。
+	if s.cfg.KeyBurst > 0 {
+		s.keyUntil = time.Now().Add(s.cfg.KeyBurst)
+	}
 	s.mu.Unlock()
 	s.enc.ForceKeyFrame()
 }
@@ -387,6 +421,24 @@ func (s *Sharer) emit(f capture.Frame) error {
 		s.wantKey = false
 		s.mu.Unlock()
 	}
+	// 补帧策略（R32）——分两层，代价与收益分开算：
+	//
+	//  1) 补帧窗口（新观众刚接入的 KeyBurst 内）：按 KeyBurstGap 反复出全量，
+	//     保证"开局一定拿到完整画面"，不依赖那一次性触发是否撞在通道未就绪上。
+	//  2) 稳态周期（KeyInterval，默认关闭）：只在明确启用时才有，属于兜底中的
+	//     兜底 —— 常态恢复靠观众端请求全量，不值得为它一直付全量帧的带宽。
+	if s.cfg.KeyBurst > 0 || s.cfg.KeyInterval > 0 {
+		now := time.Now()
+		s.mu.Lock()
+		nPeers := len(s.peers)
+		inBurst := !s.keyUntil.IsZero() && now.Before(s.keyUntil)
+		burstDue := inBurst && s.cfg.KeyBurst > 0 && now.Sub(s.lastKeyAt) >= s.cfg.KeyBurstGap
+		steadyDue := s.cfg.KeyInterval > 0 && now.Sub(s.lastKeyAt) >= s.cfg.KeyInterval
+		s.mu.Unlock()
+		if nPeers > 0 && (burstDue || steadyDue) {
+			enc.ForceKeyFrame()
+		}
+	}
 	out, err := enc.Encode(f.Pix, f.W, f.H)
 	if err != nil {
 		return err
@@ -395,6 +447,10 @@ func (s *Sharer) emit(f capture.Frame) error {
 	s.stats.Frames++
 	s.stats.Bytes += uint64(out.Bytes)
 	s.stats.EncodeMs += out.EncodeMs
+	if out.Full {
+		s.lastKeyAt = time.Now()
+		s.stats.Keys++
+	}
 	peers := make([]*rtc.Peer, 0, len(s.peers))
 	for p := range s.peers {
 		peers = append(peers, p)
