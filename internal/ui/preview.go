@@ -229,12 +229,6 @@ func layoutPreview(gtx layout.Context, th *material.Theme, view *View, src *capt
 }
 
 func layoutStatusBar(gtx layout.Context, th *material.Theme, view *View, src *capture.Source) layout.Dimensions {
-	// 面板背景
-	rect := clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops)
-	paint.ColorOp{Color: colPanel}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	rect.Pop()
-
 	st := src.Stats()
 	srcW, srcH := view.SrcSize()
 	img := view.Image()
@@ -243,7 +237,14 @@ func layoutStatusBar(gtx layout.Context, th *material.Theme, view *View, src *ca
 		showW, showH = img.Bounds().Dx(), img.Bounds().Dy()
 	}
 
-	return layout.UniformInset(unit.Dp(10)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+	// ⚠️ 背景必须"先量高度、再按高度裁剪"。
+	// 曾经写成 clip.Rect{Max: gtx.Constraints.Max}，但在 layout.Rigid 里
+	// 这个 Max 是整个窗口尺寸（Flex 不会给 Rigid 设高度上界），
+	// 结果面板色铺满整窗、把视频画面整块盖掉 —— 症状是"画面全黑只剩状态栏文字"。
+	// 同一个坑在 internal/ui/viewer.go 的 layoutStatusBar2 也踩过。
+	macro := op.Record(gtx.Ops)
+	gtx.Constraints.Min = image.Point{}
+	inner := layout.UniformInset(unit.Dp(10)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		label := func(s string, c color.NRGBA) layout.Widget {
 			l := material.Body2(th, s)
 			l.Color = c
@@ -272,6 +273,17 @@ func layoutStatusBar(gtx layout.Context, th *material.Theme, view *View, src *ca
 			layout.Rigid(label(fmt.Sprintf("已采集 %d 帧", st.Frames), colDim)),
 		)
 	})
+	call := macro.Stop()
+
+	// 背景只填状态栏这一条，高度用刚量出来的 inner.Size.Y
+	area := clip.Rect{Max: image.Pt(gtx.Constraints.Max.X, inner.Size.Y)}
+	stack := area.Push(gtx.Ops)
+	paint.ColorOp{Color: colPanel}.Add(gtx.Ops)
+	paint.PaintOp{}.Add(gtx.Ops)
+	stack.Pop()
+
+	call.Add(gtx.Ops)
+	return inner
 }
 
 // InfoLine 返回一行诊断文本，供 HUD 使用。

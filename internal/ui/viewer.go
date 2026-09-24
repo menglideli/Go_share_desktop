@@ -14,6 +14,7 @@ import (
 	"gioui.org/io/system"
 	"gioui.org/layout"
 	"gioui.org/op"
+	"gioui.org/op/clip"
 	"gioui.org/op/paint"
 	"gioui.org/text"
 	"gioui.org/unit"
@@ -154,12 +155,18 @@ func viewerLoopInner(ctx context.Context, cfg ViewerConfig, stop <-chan struct{}
 							return l.Layout(gtx)
 						}
 						// contain：保持宽高比，绝不拉伸（PLAN 层 1）
-						widget.Image{
+						dims := widget.Image{
 							Src:      paint.NewImageOp(cur),
 							Fit:      widget.Contain,
 							Position: layout.Center,
 							Scale:    1 / gtx.Metric.PxPerDp,
 						}.Layout(gtx)
+						// 只在"尺寸算成 0"这种真异常时报警：正常路径不该有日志噪音。
+						// 画面不显示时，这行能立刻区分"布局算成 0"与"画了但被盖住"。
+						if dims.Size.X == 0 || dims.Size.Y == 0 {
+							log.Printf("viewer: 警告 图像布局尺寸为 0，画面不会显示 图像=%v 约束=%v",
+								cur.Bounds().Size(), gtx.Constraints.Max)
+						}
 						return layout.Dimensions{Size: gtx.Constraints.Max}
 					})
 				}),
@@ -207,10 +214,18 @@ func viewerLoopInner(ctx context.Context, cfg ViewerConfig, stop <-chan struct{}
 	}
 }
 
+// layoutStatusBar2 画底部状态栏。
+//
+// ⚠️⚠️ 这里必须把背景的填充裁剪到状态栏自己的高度。
+// Gio 的 paint.PaintOp 填充的是"当前裁剪区域"，而 layout.Rigid 不会帮你设裁剪 ——
+// 少一个 clip，面板色就会铺满整个窗口，把上面刚画好的视频画面整块盖掉。
+// 表现就是"画面全黑，只有状态栏文字看得见"，极难往 PaintOp 上怀疑。
+// 实测踩过一次：阶段 1 的 layoutStatusBar 有这个 clip，阶段 2 重写观看端时漏掉了。
 func layoutStatusBar2(gtx layout.Context, th *material.Theme, s string) layout.Dimensions {
-	paint.ColorOp{Color: colPanel}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
-	return layout.UniformInset(unit.Dp(10)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+	// 先量内容，拿到状态栏的真实高度
+	macro := op.Record(gtx.Ops)
+	gtx.Constraints.Min = image.Point{}
+	inner := layout.UniformInset(unit.Dp(10)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		if s == "" {
 			s = "观看中"
 		}
@@ -218,6 +233,18 @@ func layoutStatusBar2(gtx layout.Context, th *material.Theme, s string) layout.D
 		l.Color = colDim
 		return l.Layout(gtx)
 	})
+	call := macro.Stop()
+
+	// 背景只填这一条：高度用刚量出来的 inner.Size.Y，绝不用 gtx.Constraints
+	// （Rigid 里的约束高度是无界的，拿它当裁剪会把画面一起盖掉）
+	area := clip.Rect{Max: image.Pt(gtx.Constraints.Max.X, inner.Size.Y)}
+	st := area.Push(gtx.Ops)
+	paint.ColorOp{Color: colPanel}.Add(gtx.Ops)
+	paint.PaintOp{}.Add(gtx.Ops)
+	st.Pop()
+
+	call.Add(gtx.Ops)
+	return inner
 }
 
 // 渲染帧数用原子量记录，供看门狗在硬退出时打印（它拿不到事件循环里的局部变量）。

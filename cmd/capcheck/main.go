@@ -317,7 +317,11 @@ func checkCursor(ctx context.Context, d capture.Display) {
 		return
 	}
 	defer src.Close()
-	fB, err := src.WaitFrame(mustCtx(ctx, 2*time.Second))
+	// 注意 cancel 必须调用：之前这里用了个 mustCtx 助手把 cancel 丢掉，
+	// go vet 会报 context 泄漏，虽不影响自检结果但会污染 vet 输出。
+	cB, cancelB := context.WithTimeout(ctx, 2*time.Second)
+	fB, err := src.WaitFrame(cB)
+	cancelB()
 	if err != nil || fB.Empty() {
 		check("取帧", false, fmt.Sprintf("err=%v", err))
 		return
@@ -362,11 +366,6 @@ func checkCursor(ctx context.Context, d capture.Display) {
 
 	savePNG(self, d, "cursor.png")
 	savePNG(sysFrame, d, "cursor-system.png")
-}
-
-func mustCtx(p context.Context, d time.Duration) context.Context {
-	c, _ := context.WithTimeout(p, d)
-	return c
 }
 
 // checkCursorCost 测光标叠加的单帧开销。

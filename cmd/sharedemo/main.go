@@ -41,6 +41,7 @@ func main() {
 	exitAfter := flag.Duration("exit", 0, "自动退出时长（如 20s）")
 	logPath := flag.String("log", "", "日志文件")
 	forcePrimary := flag.Bool("primary", false, "强制采集主屏（单/双屏下都会自摄入，仅用于对比）")
+	diag := flag.Bool("diag", false, "输出逐帧像素诊断（非黑占比/亮度），用于定位画面全黑类故障")
 	flag.Parse()
 
 	if *logPath != "" {
@@ -100,6 +101,35 @@ func main() {
 	var recvFrames, recvBytes uint64
 	var lastLatency atomicBits
 
+	// 像素诊断：全黑类故障必须能一眼看出是"没收到帧"还是"收到的帧是黑的"。
+	// 三个观测点：源帧（采集）→ 编码条带 → 解码画布。
+	var srcFrames uint64
+	// lum 的第 2、3 个参数是 R、B 的下标：BGRA 用 (2,0)，NRGBA/RGBA 用 (0,2)。
+	// 顺序搞反不会报错，只会让亮度统计轻微失真 —— 正是那种"自洽但错"的坑，所以显式分开。
+	pixStat := func(pix []byte, w, h, ri, bi int) (nonBlack float64, meanLum float64) {
+		step := 1
+		if w*h > 400000 {
+			step = 4
+		}
+		n, sum, nb := 0, 0, 0
+		for j := 0; j < h; j += step {
+			row := j * w * 4
+			for i := 0; i < w; i += step {
+				p := row + i*4
+				lum := (77*int(pix[p+ri]) + 150*int(pix[p+1]) + 29*int(pix[p+bi])) >> 8
+				sum += lum
+				if lum > 8 {
+					nb++
+				}
+				n++
+			}
+		}
+		if n == 0 {
+			return 0, 0
+		}
+		return float64(nb) / float64(n), float64(sum) / float64(n)
+	}
+
 	viewer, err := rtc.NewPeer(rtc.Config{
 		OnFrame: func(f *codec.Frame) {
 			img, err := dec.Decode(f)
@@ -109,6 +139,11 @@ func main() {
 			recvFrames++
 			recvBytes += uint64(f.Bytes)
 			lastLatency.store(dec.DecodeMs)
+			if *diag && (recvFrames <= 5 || recvFrames%60 == 0) {
+				nb, lum := pixStat(img.Pix, img.Bounds().Dx(), img.Bounds().Dy(), 0, 2)
+				log.Printf("diag 解码 #%d seq=%d full=%v 条带=%d/%d %d字节 非黑=%.1f%% 亮度=%.1f",
+					recvFrames, f.Seq, f.Full, len(f.Tiles), f.TotalTiles, f.Bytes, nb*100, lum)
+			}
 
 			var dst *image.NRGBA
 			select {
@@ -186,6 +221,14 @@ func main() {
 		FPS:     30,
 		Preset:  p,
 		Cursor:  true,
+		OnFrame: func(f *codec.Frame, src capture.Frame) {
+			srcFrames++
+			if *diag && (srcFrames <= 5 || srcFrames%60 == 0) {
+				nb, lum := pixStat(src.Pix, src.W, src.H, 2, 0)
+				log.Printf("diag 源帧 #%d %dx%d 非黑=%.1f%% 亮度=%.1f | 编码 full=%v 条带=%d/%d %d字节",
+					srcFrames, src.W, src.H, nb*100, lum, f.Full, len(f.Tiles), f.TotalTiles, f.Bytes)
+			}
+		},
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "启动采集失败: %v\n", err)
