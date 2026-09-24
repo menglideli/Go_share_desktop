@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gioui.org/app"
@@ -119,10 +120,36 @@ func viewerLoopInner(ctx context.Context, cfg ViewerConfig, stop <-chan struct{}
 
 	var ops op.Ops
 	cur := (*image.NRGBA)(nil)
-	frames := 0
+	// frames / closing 跨 goroutine（渲染循环 + 独立定时器），必须原子访问。
+	var frames atomic.Int64
 	start := time.Now()
 	ready := false
-	closing := false
+	var closing atomic.Bool
+	// closeNow 是唯一的关窗路径，CAS 保证只关一次。
+	closeNow := func(reason string) {
+		if !closing.CompareAndSwap(false, true) {
+			return
+		}
+		if cfg.Status != nil {
+			log.Printf("viewer: 结束时统计 %s", cfg.Status())
+		}
+		log.Printf("viewer: %s，关闭（共渲染 %d 帧）", reason, frames.Load())
+		w.Perform(system.ActionClose)
+		// 兜底：Windows 上关窗后 Gio 的消息循环不一定自行结束，
+		// 进程会留下一个无意义的异常退出码（实测 0xCFFFFFFF）。
+		go func() {
+			time.Sleep(2 * time.Second)
+			log.Printf("viewer: 关窗后未自行退出，兜底结束")
+			exitNow() // 硬退出前把要说的话说完（如向分享端发 Bye）
+			os.Exit(0)
+		}()
+	}
+	if cfg.ExitAfter > 0 {
+		// 独立定时器，不依赖渲染帧 —— 窗口最小化后 Gio 不再产生 FrameEvent，
+		// 靠渲染循环检查时间的写法会被饿死（分享端那边实测 `-exit 22s`
+		// 跑了 83 秒，见 internal/ui/shell.go 的同类注释）。
+		time.AfterFunc(cfg.ExitAfter, func() { closeNow("ExitAfter 到时") })
+	}
 	status := ""
 
 	for {
@@ -138,7 +165,7 @@ func viewerLoopInner(ctx context.Context, cfg ViewerConfig, stop <-chan struct{}
 		e := w.Event()
 		switch e := e.(type) {
 		case app.DestroyEvent:
-			log.Printf("viewer: DestroyEvent err=%v frames=%d", e.Err, frames)
+			log.Printf("viewer: DestroyEvent err=%v frames=%d", e.Err, frames.Load())
 			return e.Err
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
@@ -196,34 +223,22 @@ func viewerLoopInner(ctx context.Context, cfg ViewerConfig, stop <-chan struct{}
 				}),
 			)
 			e.Frame(gtx.Ops)
-			frames++
-			atomicStoreFrames(frames)
+			n := frames.Add(1)
+			atomicStoreFrames(int(n))
 
-			if frames == 1 || frames%60 == 0 {
-				log.Printf("viewer: 渲染第 %d 帧（画面 %v）", frames, cur != nil)
+			if n == 1 || n%60 == 0 {
+				log.Printf("viewer: 渲染第 %d 帧（画面 %v）", n, cur != nil)
 			}
-			if !ready && frames == 10 {
+			if !ready && n == 10 {
 				ready = true
 				LogWindowVisible(cfg.Title)
 				if cfg.OnReady != nil {
 					cfg.OnReady()
 				}
 			}
-			if cfg.ExitAfter > 0 && time.Since(start) > cfg.ExitAfter && !closing {
-				closing = true
-				if cfg.Status != nil {
-					log.Printf("viewer: 结束时统计 %s", cfg.Status())
-				}
-				log.Printf("viewer: ExitAfter 到时，关闭（共渲染 %d 帧）", frames)
-				w.Perform(system.ActionClose)
-				// 兜底：Windows 上关窗后 Gio 的消息循环不一定自行结束，
-				// 进程会留下一个无意义的异常退出码（实测 0xCFFFFFFF）。
-				go func() {
-					time.Sleep(2 * time.Second)
-					log.Printf("viewer: 关窗后未自行退出，兜底结束")
-					exitNow() // 硬退出前把要说的话说完（如向分享端发 Bye）
-					os.Exit(0)
-				}()
+			// 兜底检查（定时器为主，这条覆盖窗口可见时更早响应的情况）。
+			if cfg.ExitAfter > 0 && time.Since(start) > cfg.ExitAfter {
+				closeNow("ExitAfter 到时")
 			}
 			// 有新帧时请求下一轮，保证画面流畅
 			w.Invalidate()

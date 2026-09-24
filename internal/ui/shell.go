@@ -17,6 +17,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gioui.org/app"
@@ -82,6 +83,15 @@ type JoinState struct {
 	Status   string
 	Found    []FoundRow
 	Scanning bool
+	// Notice 是**叠在画面上**的醒目提示（如"对方已停止分享"）。
+	// 空表示不显示。
+	//
+	// 为什么要有它：断流时画面会**冻结在最后一帧**（lastFrame 不会被清），
+	// 用户看到的是"一张静止的图"，分不清是对方停了、自己卡了、
+	// 还是画面本来就不动。光看 fps 归零没有任何提示。
+	Notice string
+	// NoticeWarn 为 true 时用警告色（断开），false 用常规色（暂停等可恢复情况）。
+	NoticeWarn bool
 }
 
 // ShellConfig 是应用外壳的构建参数。回调全部可选（nil 表示无动作）。
@@ -342,8 +352,33 @@ func (s *Shell) Run(ctx context.Context) error {
 
 	var ops op.Ops
 	start := time.Now()
-	frames := 0
-	closing := false
+	// frames 与 closing 是**跨 goroutine** 的（渲染循环 + 独立定时器），
+	// 必须原子访问。见下面 ExitAfter 的注释。
+	var frames atomic.Int64
+	var closing atomic.Bool
+	// closeNow 是唯一的关窗路径：定时器与渲染循环都走它，CAS 保证只关一次。
+	closeNow := func(reason string) {
+		if !closing.CompareAndSwap(false, true) {
+			return
+		}
+		log.Printf("shell: %s，关闭窗口（共渲染 %d 帧）", reason, frames.Load())
+		go func() {
+			time.Sleep(2 * time.Second)
+			log.Printf("shell: 关窗后未自行退出，兜底结束")
+			os.Exit(0)
+		}()
+		w.Perform(system.ActionClose)
+	}
+	if s.cfg.ExitAfter > 0 {
+		// ⚠️ 定时器**必须独立于渲染帧**。
+		//
+		// 原来的写法是在 FrameEvent 里检查 time.Since(start) > ExitAfter —— 但
+		// 防自摄入会把主窗最小化（见 internal/ui/winmin_windows.go），最小化后
+		// Gio 不再产生 FrameEvent，检查被饿死，实测 `-exit 22s` 实际跑了 83 秒
+		// 才退出（日志："共渲染 6 帧"）。危害不只是验证不准：进程残留会一直占着
+		// 信令端口、持续采集编码、吃 1GB 内存，而它看起来"什么都没做"。
+		time.AfterFunc(s.cfg.ExitAfter, func() { closeNow("ExitAfter 到时") })
+	}
 	wasRegion := false
 
 	for {
@@ -379,17 +414,12 @@ func (s *Shell) Run(ctx context.Context) error {
 
 			s.Layout(gtx, th)
 			e.Frame(gtx.Ops)
-			frames++
+			frames.Add(1)
 
-			if s.cfg.ExitAfter > 0 && time.Since(start) > s.cfg.ExitAfter && !closing {
-				closing = true
-				log.Printf("shell: ExitAfter 到时，关闭窗口（共渲染 %d 帧）", frames)
-				go func() {
-					time.Sleep(2 * time.Second)
-					log.Printf("shell: 关窗后未自行退出，兜底结束")
-					os.Exit(0)
-				}()
-				w.Perform(system.ActionClose)
+			// 兜底：渲染循环也检查一次（窗口可见时比定时器更早响应，
+			// 且能覆盖定时器被系统时钟大幅跳变影响的极端情况）。
+			if s.cfg.ExitAfter > 0 && time.Since(start) > s.cfg.ExitAfter {
+				closeNow("ExitAfter 到时")
 			}
 			w.Invalidate()
 		}

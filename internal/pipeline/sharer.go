@@ -112,6 +112,15 @@ type Stats struct {
 	Heartbeat uint64
 	Keys      uint64 // 全量帧数（含接入/切换档位/周期兜底）
 	EncodeMs  float64 // 均值
+	// SentBytes / SentFrames 是**真正发给观众的**字节与人次帧数。
+	//
+	// 和 Bytes / Frames 的区别：编码只做一次（Bytes 记的是这一份），
+	// 但要给 N 个观众各发一份，且弱网观众会被背压丢掉。
+	// 所以 Bytes 是"编码码率"，SentBytes 才是"出网码率"——
+	// 5 人时前者 4.0 Mbps、后者约 16 Mbps，HUD 上必须分开显示，
+	// 否则按 4 Mbps 估带宽会严重低估（实测踩过）。
+	SentBytes  uint64
+	SentFrames uint64
 	capture.Stats
 }
 
@@ -460,9 +469,22 @@ func (s *Sharer) emit(f capture.Frame) error {
 	if s.cfg.OnFrame != nil {
 		s.cfg.OnFrame(out, f)
 	}
+	// 只有真正发出去（通道已开且没被背压丢掉）的才算出网。
+	// 统计它而不是"编码字节 × 人数"，是因为弱网观众会被背压丢帧，
+	// 乘出来的数字会高估（背压越重差得越多）。
+	var sentBytes, sentFrames uint64
 	for _, p := range peers {
 		// 背压在 Peer 内部处理：弱网观众自己丢帧，不影响其他人
-		_ = p.SendFrame(out)
+		if err := p.SendFrame(out); err == nil {
+			sentBytes += uint64(out.Bytes)
+			sentFrames++
+		}
+	}
+	if sentFrames > 0 {
+		s.mu.Lock()
+		s.stats.SentBytes += sentBytes
+		s.stats.SentFrames += sentFrames
+		s.mu.Unlock()
 	}
 	return nil
 }

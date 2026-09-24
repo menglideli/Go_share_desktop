@@ -52,6 +52,8 @@ func main() {
 	dumpAt := flag.Uint64("dump-at", 40, "-dump-frame 指定存第几帧")
 	// 既是为了逐条验证恢复路径（关掉某条路，看画面还能不能自愈），
 	// 也是产品上的调优旋钮。
+	switchAt := flag.Duration("switch-at", 0, "分享开始 N 秒后热切换采集区域（自动化验证用，0 = 不切）")
+	switchRegion := flag.String("switch-region", "", "热切换到的区域，格式 宽x高+左+上（如 800x600+100+100）")
 	keyInterval := flag.Duration("key-interval", 0, "稳态周期性全量帧间隔（0/负值=禁用，靠观众请求恢复）")
 	keyBurst := flag.Duration("key-burst", 3*time.Second, "新观众接入后的密集补帧窗口（负值禁用）")
 	flag.Parse()
@@ -88,6 +90,7 @@ func main() {
 		ctx: ctx, port: *port, maxViewers: *maxViewers, fixedCode: *code,
 		dumpPath: *dumpFrame, dumpAt: *dumpAt,
 		keyInterval: *keyInterval, keyBurst: *keyBurst,
+		switchAt: *switchAt, switchRegion: *switchRegion,
 	}
 	a.shell = ui.NewShell(ui.ShellConfig{
 		Title:    "GoShare · 内网桌面共享",
@@ -161,6 +164,7 @@ type app struct {
 	// HUD 增量统计用
 	lastFrames uint64
 	lastBytes  uint64
+	lastSent   uint64
 	lastAt     time.Time
 	view       *ui.View
 
@@ -173,6 +177,14 @@ type app struct {
 	wDec      float64
 	wNonBlack float64
 	wLum      float64
+	// wICE 是当前 ICE 连接状态（webrtc.ICEConnectionState 底层是 int）。
+	//
+	// 需要它是因为"收不到帧"有好几种原因：对方停止分享、自己网络断了、
+	// 对方暂停了。只看 fps 归零分不清，必须结合 ICE 状态才能给出准确提示。
+	wICE atomic.Int32
+	// wLastFrameAt 是最后一次收到帧的时刻（UnixNano，0 表示还没收到过）。
+	// 静止桌面靠 2s 心跳帧保活，所以"超过 5s 没有帧"本身就是异常信号。
+	wLastFrameAt atomic.Int64
 
 	// blackWarned 记录"全黑"告警是否已上报，避免每 500ms 刷屏。
 	blackWarned bool
@@ -185,6 +197,10 @@ type app struct {
 	// keyInterval / keyBurst：全量帧补帧策略（见 -key-interval / -key-burst）。
 	keyInterval time.Duration
 	keyBurst    time.Duration
+	// switchAt / switchRegion：自动化验证用，分享开始后热切换采集区域
+	// （见 -switch-at / -switch-region）。
+	switchAt     time.Duration
+	switchRegion string
 
 	// ---- 观看端画面完整性（R32）----
 	// needFull：当前画布不完整，需要一帧全量。初始为 true —— 观众在收到
@@ -400,7 +416,7 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 	a.ann = ann
 	a.stop = cancel
 	a.stopHUD = make(chan struct{})
-	a.lastFrames, a.lastBytes, a.lastAt = 0, 0, time.Now()
+	a.lastFrames, a.lastBytes, a.lastSent, a.lastAt = 0, 0, 0, time.Now()
 	hudStop := a.stopHUD
 	a.mu.Unlock()
 
@@ -409,6 +425,34 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 			log.Printf("分享管线结束: %v", err)
 		}
 	}()
+
+	// 自动化验证用：分享开始 N 秒后热切换采集区域。
+	// 走的就是界面"换区域"该走的那条路（Sharer.SetRegion → src.SetRegion +
+	// ForceKeyFrame），所以它能验证的结论对界面入口同样成立。
+	//
+	// 为什么必须 ForceKeyFrame：区域变了，观众侧画布尺寸也变了。
+	// 增量帧只覆盖"变化过的条带"，尺寸变化后旧画布上没被覆盖的区域会残留
+	// 上一块区域的画面（或黑边）—— 和 R32 是同一类问题。
+	if a.switchAt > 0 && a.switchRegion != "" {
+		r, perr := parseRect(a.switchRegion, opts.Display)
+		if perr != nil {
+			log.Printf("换区域参数无法解析（%q）：%v", a.switchRegion, perr)
+		} else {
+			wait := a.switchAt
+			go func() {
+				select {
+				case <-time.After(wait):
+				case <-shCtx.Done():
+					return
+				}
+				log.Printf("自动化：热切换到区域 %dx%d+%d+%d", r.W, r.H, r.X, r.Y)
+				sh.SetRegion(r)
+				a.mu.Lock()
+				a.region = r
+				a.mu.Unlock()
+			}()
+		}
+	}
 	go a.hudLoop(hudStop)
 
 	log.Printf("分享已开始：端口 %d 授权码 %s 地址 %v", srv.Port(), srv.Code(), srv.ShareAddrs())
@@ -470,14 +514,20 @@ func (a *app) pushShareState() {
 	el := now.Sub(a.lastAt).Seconds()
 	df := st.Frames - a.lastFrames
 	db := st.Bytes - a.lastBytes
-	a.lastFrames, a.lastBytes, a.lastAt = st.Frames, st.Bytes, now
+	ds := st.SentBytes - a.lastSent
+	a.lastFrames, a.lastBytes, a.lastSent, a.lastAt = st.Frames, st.Bytes, st.SentBytes, now
 	a.mu.Unlock()
 
 	fps := 0.0
 	mbps := 0.0
+	// outMbps 是**出网**码率：同一份编码要给 N 个观众各发一份，
+	// 所以它是编码码率的 N 倍（弱网被背压丢掉的还不算）。
+	// 只显示编码码率会让人严重低估带宽（5 人时 4.0 vs 实际约 16 Mbps）。
+	outMbps := 0.0
 	if el > 0 {
 		fps = float64(df) / el
 		mbps = float64(db) * 8 / el / 1e6
+		outMbps = float64(ds) * 8 / el / 1e6
 	}
 
 	rows := make([]ui.ViewerRow, 0, 8)
@@ -497,8 +547,8 @@ func (a *app) pushShareState() {
 	// 拿到手就是"每帧编码耗时"，不要再除一次帧数 —— 除两次会显示成 0.0 ms。
 	encAvg := st.EncodeMs
 
-	hud := fmt.Sprintf("发送 %.1f fps · %.1f Mbps\n编码 %.1f ms · 采集 %s\n已发 %d 帧 · 观众 %d 人\n共享 %s",
-		fps, mbps, encAvg, st.Backend, st.Frames, len(rows), regionText)
+	hud := fmt.Sprintf("发送 %.1f fps · 出网 %.1f Mbps（%d 路）\n编码 %.1f ms · 单路 %.1f Mbps · 采集 %s\n已发 %d 帧 · 观众 %d 人\n共享 %s",
+		fps, outMbps, len(rows), encAvg, mbps, st.Backend, st.Frames, len(rows), regionText)
 
 	// 采集源取不到画面（锁屏 / 安全桌面 / 后端异常）时明确说出来。
 	// 不提示的话，用户看到的只是"一片黑"，无法区分是自己设置错了还是断线了。
@@ -526,8 +576,8 @@ func (a *app) pushShareState() {
 	tick := a.hudTicks
 	a.mu.Unlock()
 	if tick%6 == 0 {
-		log.Printf("分享统计：%.1f fps · %.1f Mbps · 编码均值 %.1f ms · 全量帧 %d/%d · 观众 %d 人",
-			fps, mbps, encAvg, st.Keys, st.Frames, len(rows))
+		log.Printf("分享统计：%.1f fps · 出网 %.2f Mbps（单路 %.2f × %d 人）· 编码均值 %.1f ms · 全量帧 %d/%d · 观众 %d 人",
+			fps, outMbps, mbps, len(rows), encAvg, st.Keys, st.Frames, len(rows))
 	}
 
 	a.shell.SetShareState(ui.ShareState{
@@ -741,7 +791,17 @@ func (a *app) dialOnce(dec *codec.Decoder, addr, code string) (*signal.Session, 
 			Peer: rtc.Config{
 				UDPPortMin: udpPortMin,
 				UDPPortMax: udpPortMax,
+				// OnState 只做记录与打日志 —— 它跑在 ICE agent 的内部 goroutine 上，
+				// 任何会等待 ICE 的动作（尤其是 Close）都会和 agent 收尾互等死锁，
+				// 表现为进程静默卡死（PLAN 约束 8）。
+				OnState: func(st webrtc.ICEConnectionState) {
+					prev := webrtc.ICEConnectionState(a.wICE.Swap(int32(st)))
+					if prev != st {
+						log.Printf("观看连接状态：%v → %v", prev, st)
+					}
+				},
 				OnFrame: func(f *codec.Frame) {
+					a.wLastFrameAt.Store(time.Now().UnixNano())
 					img, err := dec.Decode(f)
 					if err != nil {
 						return
@@ -796,6 +856,10 @@ func (a *app) watchStatusLoop() {
 	t := time.NewTicker(500 * time.Millisecond)
 	defer t.Stop()
 	ticks := 0
+	// 这两个都是本 goroutine 私有的（每次接入新起一个循环），
+	// 放在这里而不是 app 上，省掉锁也省掉跨接入的残留状态。
+	downTicks := 0
+	lastNotice := ""
 	for {
 		a.mu.Lock()
 		sess := a.sess
@@ -819,7 +883,58 @@ func (a *app) watchStatusLoop() {
 		st := fmt.Sprintf("%s · %.1f fps · %.1f Mbps · 解码 %.1f ms", sess.Info.Name, fps, mbps, a.wDec)
 		nb, lum, fr := a.wNonBlack, a.wLum, a.wFrames
 		a.mu.Unlock()
-		a.shell.SetJoinState(ui.JoinState{Status: st})
+
+		// 断流判定。分两种情况给不同的话术 —— 只报"fps 0.0"用户不知道发生了什么：
+		//   ICE 断开  → 对方停止分享 or 网络断了（要去排查）
+		//   ICE 正常但画面不来 → 多半是对方暂停了（等一下就好）
+		js := ui.JoinState{Status: st}
+		ice := webrtc.ICEConnectionState(a.wICE.Load())
+		frameAge := time.Duration(0)
+		if t := a.wLastFrameAt.Load(); t > 0 {
+			frameAge = time.Since(time.Unix(0, t))
+		}
+		switch ice {
+		case webrtc.ICEConnectionStateFailed, webrtc.ICEConnectionStateClosed,
+			webrtc.ICEConnectionStateDisconnected:
+			// 防抖：ICE 短暂 disconnected 很常见（几秒内常会自愈），
+			// 立刻弹"对方已停止分享"会误报；连续 1.5s 才认。
+			downTicks++
+			switch {
+			case downTicks >= 3:
+				js.Notice = fmt.Sprintf("连接已断开（%v）—— 对方可能已停止分享，或网络中断", ice)
+				js.NoticeWarn = true
+			case lastNotice != "":
+				// 防抖期内**沿用**上一条提示，不要凭空清空。
+				// 清空会让下面那句"提示已清除"的日志谎报"画面恢复正常" ——
+				// 实测踩过：ICE 刚转 disconnected 的那一帧打出"画面恢复正常"，
+				// 而画面明明还是死的（只是防抖计数还没到 3）。
+				js.Notice = lastNotice
+				js.NoticeWarn = true
+			}
+		default:
+			downTicks = 0
+			// 静止桌面有 2s 心跳帧保活，所以"5s 没有帧"本身就是异常。
+			if frameAge > 5*time.Second {
+				js.Notice = "画面已超过 5 秒没有更新 —— 对方可能已暂停分享"
+			}
+		}
+		if js.Notice != lastNotice {
+			// 只在翻转时打一条，否则每 500ms 刷屏（PLAN 约束 17）。
+			if js.Notice == "" {
+				// 措辞必须区分"真恢复"与"判据切换导致提示消失"：
+				// 只有最近确实收到帧，才敢说画面恢复了。
+				if frameAge <= 2*time.Second {
+					log.Printf("观看提示已清除：画面恢复更新（%.1fs 前收到帧）", frameAge.Seconds())
+				} else {
+					log.Printf("观看提示已清除，但最近一帧已是 %.1fs 前 —— 画面并未恢复，只是判据切换",
+						frameAge.Seconds())
+				}
+			} else {
+				log.Printf("观看提示上屏：%s", js.Notice)
+			}
+			lastNotice = js.Notice
+		}
+		a.shell.SetJoinState(js)
 		ps := sess.Peer.Stats()
 		// 丢分片 = 画布上少了一块，而且少的那块不会自己回来（增量帧只覆盖
 		// 变化区域）→ 立刻请全量。sendPLI 自带 300ms 限流，持续丢就是持续重试。
@@ -954,6 +1069,32 @@ func hostName() string {
 		return h
 	}
 	return "GoShare"
+}
+
+// parseRect 解析 "宽x高+左+上"（如 800x600+100+100）。
+// 空串与 "full"/"整屏" 表示恢复整屏（用空区域表示，与界面语义一致）。
+//
+// 结果统一过一遍 Rect.Clamp：一是裁到显示器范围内，二是**保证宽高为偶数**
+// （视频编码要求，奇数宽高会在转换环节出问题）。偶数化这种事交给
+// 已有的 Clamp 做，比自己再写一遍靠谱。
+func parseRect(s string, d capture.Display) (capture.Rect, error) {
+	t := strings.TrimSpace(s)
+	if t == "" || t == "full" || t == "整屏" {
+		return capture.Rect{}, nil
+	}
+	var w, h, x, y int
+	n, err := fmt.Sscanf(t, "%dx%d+%d+%d", &w, &h, &x, &y)
+	if n < 2 {
+		return capture.Rect{}, fmt.Errorf("格式应为 宽x高+左+上（如 800x600+100+100）：%v", err)
+	}
+	if n < 4 {
+		x, y = 0, 0
+	}
+	r := capture.Rect{X: x, Y: y, W: w, H: h}.Clamp(d)
+	if r.Empty() {
+		return capture.Rect{}, fmt.Errorf("区域 %dx%d+%d+%d 裁剪后为空（显示器 %dx%d）", w, h, x, y, d.W, d.H)
+	}
+	return r, nil
 }
 
 // printFirewallHint 打印一条可直接执行的放行命令。

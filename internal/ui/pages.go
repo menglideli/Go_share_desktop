@@ -846,6 +846,35 @@ func (s *Shell) pageViewing(gtx layout.Context, th *material.Theme) layout.Dimen
 					return l.Layout(gtx)
 				})
 			}
+			// 断流/暂停提示条：叠在画面底部。
+			//
+			// 没有它的话，断开后画面**冻结在最后一帧**（lastFrame 不清空），
+			// 用户看到的是一张静止的图，分不清"对方停止分享了"、"自己网络断了"
+			// 还是"画面本来就不动"。实测过：只看 fps 归零，界面上毫无提示。
+			if js.Notice != "" {
+				col := colDim
+				if js.NoticeWarn {
+					col = colWarn
+				}
+				layout.S.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					// ⚠️ 先量高度再按量到的高度填背景。
+					// Gio 的 PaintOp 填的是**当前裁剪区域**，直接填会铺满整个窗口
+					// 把画面盖掉（阶段 2 踩过，见 PLAN 约束 2）。
+					m := op.Record(gtx.Ops)
+					inset := layout.UniformInset(unit.Dp(8))
+					inner := inset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						gtx.Constraints.Min.X = gtx.Constraints.Max.X
+						l := material.Body2(th, js.Notice)
+						l.Color = col
+						return l.Layout(gtx)
+					})
+					c := m.Stop()
+					paint.FillShape(gtx.Ops, color.NRGBA{R: 18, G: 18, B: 18, A: 225},
+						clip.Rect(image.Rectangle{Max: inner.Size}).Op())
+					c.Add(gtx.Ops)
+					return inner
+				})
+			}
 			stack.Pop()
 			return layout.Dimensions{Size: gtx.Constraints.Max}
 		}),
