@@ -75,6 +75,9 @@ type Source struct {
 	wait    time.Duration
 	proc    time.Duration
 	started time.Time
+	// warm 为 true 时表示处于预热期（Warmup）：此间的黑帧不写入 last，
+	// 免得"桌面静止 + 首帧黑"时把一帧黑永久留给观众。见 warmup.go。
+	warm bool
 }
 
 // NewSource 启动采集。region 为空时采集整个显示器。
@@ -233,7 +236,13 @@ func (s *Source) WaitFrame(ctx context.Context) (Frame, error) {
 	s.wait += waited
 	s.proc += processed
 	// 心跳兜底（P0-4）：直接引用刚写完的这块缓冲，下一帧会写另一块。
-	s.last = out
+	//
+	// 预热期（Warmup）例外：DXGI 建流后首帧可能是未初始化的黑帧（R25），
+	// 若桌面恰好静止、后续长时间不出帧，这帧黑会一直挂在 last 上被观众看到。
+	// 预热期只让非黑帧成为兜底帧；正常运行时不做这个判断，省掉每帧一次扫描。
+	if !s.warm || !mostlyBlack(out.Pix) {
+		s.last = out
+	}
 	s.region = region
 	return out, nil
 }

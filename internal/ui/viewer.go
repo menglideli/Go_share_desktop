@@ -36,6 +36,12 @@ type ViewerConfig struct {
 	ExitAfter time.Duration
 	// OnReady 窗口渲染出第一帧后调用（例如把窗口挪到副屏，避免采集到自己）。
 	OnReady func()
+	// OnExit 在退出之前调用一次，且**同步**执行完毕（含兜底 os.Exit 路径）。
+	//
+	// 存在的理由：关窗后 Gio 的事件循环不一定自行结束，这里会用 os.Exit 硬退出，
+	// 那样调用方 main 里的 defer 全部不会执行 —— 实测就是"观看端走了但分享端
+	// 仍显示 2 人"，因为 Bye 那一句被跳过了。要发通知就放在这里。
+	OnExit func()
 }
 
 // RunViewer 打开观看端窗口并持续渲染收到的画面。
@@ -88,6 +94,16 @@ func viewerLoop(ctx context.Context, cfg ViewerConfig, stop <-chan struct{}) (er
 }
 
 func viewerLoopInner(ctx context.Context, cfg ViewerConfig, stop <-chan struct{}) error {
+	// 只执行一次：正常返回与兜底 os.Exit 两条路径都会经过它。
+	var exitOnce sync.Once
+	exitNow := func() {
+		if cfg.OnExit == nil {
+			return
+		}
+		exitOnce.Do(cfg.OnExit)
+	}
+	defer exitNow()
+
 	th := material.NewTheme()
 	th.Shaper = text.NewShaper(text.WithCollection(loadFontFaces()))
 	th.Palette.Bg = colBG
@@ -205,6 +221,7 @@ func viewerLoopInner(ctx context.Context, cfg ViewerConfig, stop <-chan struct{}
 				go func() {
 					time.Sleep(2 * time.Second)
 					log.Printf("viewer: 关窗后未自行退出，兜底结束")
+					exitNow() // 硬退出前把要说的话说完（如向分享端发 Bye）
 					os.Exit(0)
 				}()
 			}

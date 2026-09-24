@@ -61,6 +61,9 @@ type Config struct {
 	FPS     int // 采集目标帧率（库参数），0 用默认 30
 	Preset  Preset
 	Cursor  bool
+	// Warmup 是"丢弃首帧黑帧"的超时上限（R25）。
+	// 0 表示用默认 600ms；负数表示禁用预热（排障对比时有用）。
+	Warmup time.Duration
 	// IdleHeartbeat 是桌面静止时的保活间隔。0 表示用默认 2s。
 	IdleHeartbeat time.Duration
 	// OnFrame 每编码完一帧回调（诊断/预览用），可为 nil。
@@ -111,6 +114,11 @@ func NewSharer(ctx context.Context, cfg Config) (*Sharer, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	// 预热：DXGI 建流后的首帧常是未初始化的黑帧（实测 3 次里 2 次）。
+	// 在这里丢掉它，观众接入时第一眼就是真画面，而不是"闪一下黑"。
+	if cfg.Warmup >= 0 {
+		_, _ = src.Warmup(ctx, 3, cfg.Warmup)
 	}
 	return &Sharer{
 		cfg:   cfg,

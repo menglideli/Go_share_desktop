@@ -11,6 +11,7 @@ package rtc
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -55,14 +56,23 @@ type Config struct {
 	OnControl func(t CtlType, payload []byte)
 	// OnState 连接状态变化。
 	OnState func(state webrtc.ICEConnectionState)
+	// UDPPortMin / UDPPortMax 限定本地 UDP 端口范围。
+	//
+	// 为什么需要：媒体面用的是临时端口，随机的话没法写防火墙规则 ——
+	// 同事那台开着 Domain 防火墙，入站 UDP 一拦就是"地址没错但连不上"。
+	// 固定区间后，放行规则可以写成一条固定命令（见 sigdemo 启动时打印的 netsh 指引）。
+	// 都为 0 表示用 pion 默认（49152~65535）。
+	UDPPortMin uint16
+	UDPPortMax uint16
 }
 
 // Peer 封装一个 PeerConnection 及两条数据通道。
 type Peer struct {
 	cfg Config
 	pc   *webrtc.PeerConnection
-	media *webrtc.DataChannel
-	ctl   *webrtc.DataChannel
+	media    *webrtc.DataChannel
+	ctl      *webrtc.DataChannel
+	viewerCh *webrtc.DataChannel // 观看端为协商 m-line 而建，见 SetupViewer
 
 	mu    sync.Mutex
 	stats Stats
@@ -71,7 +81,15 @@ type Peer struct {
 
 // NewPeer 创建 Peer。
 func NewPeer(cfg Config) (*Peer, error) {
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+	api := webrtc.NewAPI()
+	if cfg.UDPPortMax > cfg.UDPPortMin && cfg.UDPPortMin > 0 {
+		var se webrtc.SettingEngine
+		if err := se.SetEphemeralUDPPortRange(cfg.UDPPortMin, cfg.UDPPortMax); err != nil {
+			return nil, fmt.Errorf("rtc: 设置 UDP 端口范围失败：%w", err)
+		}
+		api = webrtc.NewAPI(webrtc.WithSettingEngine(se))
+	}
+	pc, err := api.NewPeerConnection(webrtc.Configuration{
 		ICEServers: cfg.ICEServers,
 	})
 	if err != nil {
@@ -93,6 +111,25 @@ func (p *Peer) OnICECandidate(f func(*webrtc.ICECandidate)) { p.pc.OnICECandidat
 // AddICECandidate 添加对端候选。
 func (p *Peer) AddICECandidate(c webrtc.ICECandidateInit) error {
 	return p.pc.AddICECandidate(c)
+}
+
+// WaitGathering 等待本地候选收集完成，non-trickle 信令（HTTP 一次换完 SDP）需要它。
+//
+// ⚠️ 必须在 SetLocalDescription **之前或紧随其后**调用：pion 的 GatheringCompletePromise
+// 在收集已完成时会立即关闭 channel，所以就算晚一步也不会永久阻塞，
+// 但晚太久会白等一个超时。返回 false 表示超时（不是故障，仍可带着已有候选继续）。
+func (p *Peer) WaitGathering(timeout time.Duration) bool {
+	done := webrtc.GatheringCompletePromise(p.pc)
+	if timeout <= 0 {
+		<-done
+		return true
+	}
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // Close 关闭连接。
@@ -118,6 +155,25 @@ func (p *Peer) SetupMedia() error {
 		return err
 	}
 	p.attach(m, c)
+	return nil
+}
+
+// SetupViewer 由观看端在 CreateOffer **之前**调用：创建一条通道，
+// 让 SDP 里出现 m=application 段。
+//
+// ⚠️ 这不是可选动作。pion 只在 PeerConnection 上有 data channel 或 transceiver 时
+// 才生成 m-line；观看端的 media/ctl 都是**对端**创建的、要等 OnDataChannel 才有，
+// 于是不建通道就 CreateOffer 会得到一份 232 字节、连 ice-ufrag 都没有的 SDP ——
+// 对端 SetRemoteDescription 直接报 "called with no ice-ufrag"（实测踩过）。
+// 这条通道本身不传数据，纯粹为了把 application 段协商出来。
+func (p *Peer) SetupViewer() error {
+	d, err := p.pc.CreateDataChannel("viewer", nil) // 可靠有序，无需回调
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.viewerCh = d
+	p.mu.Unlock()
 	return nil
 }
 

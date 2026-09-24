@@ -480,6 +480,8 @@ Go_share_desktop/
 | **R24** | **`paint.PaintOp` 不设 clip 会铺满整个窗口** | 观看端状态栏背景漏写 `clip`，面板色盖住先画好的视频画面 → **画面全黑、只剩状态栏文字**。Gio 的 `PaintOp` 填充的是"当前裁剪区域"，而 `layout.Rigid` 不会替你设裁剪。已修（`viewer.go` / `preview.go` 统一改为"先量高度、再按高度裁剪"），并用反向变异验证：去掉 clip 立刻复现全黑 |
 | **R25** | **DXGI Duplication 建立后的首帧可能是未初始化的黑帧** | 实测 3 次里 2 次出现（两块显示器都有）。观众端开屏闪一帧黑；若桌面恰好静止，这帧黑会挂到下一次桌面变化。当前仅记录未修（第二帧起即正常），**阶段 3 接入多观众前需处理**（预热丢一帧 + 有限超时兜底，不能无条件丢首帧，否则静止桌面会永远等不到画面） |
 | **R26** | **"渲染了 N 帧"证明不了"画面可见"** | 阶段 1/2 的验证只看 `hwnd visible` 与渲染帧计数，两者在画面被完全盖住时**依然通过**——R24 就是这么漏掉整个阶段的。凡涉及画面输出的改动，**必须用像素证据（截图 + 非黑占比统计）收口**。工具：`cmd/shot`（截屏存 PNG）、`cmd/pixprobe`(逐环节像素统计)、`cmd/viewertest`（隔离渲染层与数据层） |
+| **R27** | **绝不能在 pion 的状态回调里同步做清理** | 观众退出时 `OnState(closed)` → 同步 `peer.Close()`：回调占着 ICE agent 的内部 goroutine，而 `Close` 要等 agent 收尾 —— 两边互等，**整个分享端当场静默卡死**（无 panic、无日志），后续所有观众接入都 `context deadline exceeded`。实测两次复现。正解：清理动作挪进独立 goroutine，回调立即返回。同理，**幂等不能用 `sync.Once`**（cleanup → srv.Drop → closeFn → 又是 cleanup，同 goroutine 重入 `once.Do` 永久阻塞），要用 mutex+flag |
+| **R28** | **别持锁回调，也别造回调环** | `Server.Kick` 原本在 `s.mu` 里调 `v.closeFn()`，而 closeFn 会反向调 `srv.Detach/Drop` → 抢同一把锁自锁。规则：**先摘记录、解锁、再回调**。另外 `Drop`（移除+回调）和 `Detach`（只移除）必须分开：分享端 cleanup 里已经自己关了 Peer，就该用 `Detach`，否则形成 Drop→closeFn→cleanup 的回环 |
 
 ---
 
@@ -496,8 +498,17 @@ Go_share_desktop/
 - [x] Dirty tile 增量更新 —— 已实现并验证：真实桌面带宽从理论 200 Mbps 降到 **5~10 Mbps**
 - [x] **修复观看窗全黑（R24）** —— 2026-09-24：状态栏背景 `PaintOp` 漏了 clip，铺满整窗盖住画面。
       已修 `viewer.go` + `preview.go`，反向变异验证通过；顺带补上像素级验证工具（`shot` / `pixprobe` / `viewertest`）
-- [ ] **阶段 3：信令与接入** —— HTTP 信令 + 授权码 + 多网卡列表 + 一键复制 + 局域网自动发现（下一步）
-- [ ] 处理 R25：DXGI 首帧黑（阶段 3 接入多观众前必须处理，否则新观众可能先看到一帧黑）
+- [x] 阶段 3：信令与接入 —— 2026-09-24 完成：
+      `internal/netif`（多网卡枚举，实测 6 个可分享地址、默认路由排首位）、
+      `internal/signal`（HTTP 信令 + 授权码 + 失败限次冷却 + 观众上限 + non-trickle ICE）、
+      `internal/discover`（UDP 广播自动发现）、`internal/clip`（一键复制，纯 syscall 无 CGO）、
+      `cmd/sigdemo`（host/watch 两端）、`cmd/sigcheck`（信令自检 29/29）。
+      实测：跨进程 + 局域网真实 IP 接入成功（握手 531~889ms，27~29fps / 8 Mbps）；
+      两观众并发在线「当前 2 人」；指定地址与自动发现两条路径均可接入
+- [x] 处理 R25：DXGI 首帧黑 —— 已修：`capture.Source.Warmup()` 预热丢弃未初始化黑帧
+      （有限次数 3 + 600ms 超时兜底，且预热期不更新 `Last()`，避免静止桌面观众永远看黑）。
+      实测 10/10 → 0/10；已固化进 `capcheck` 第 12 项
+- [x] 修复 R27/R28：观众退出时分享端卡死 —— 见风险表
 - [ ] 向 go264 作者反馈 MF 编码死锁（保留未来回退 H.264 的路）
 - [ ] 交互式区域框选（阶段 4 完整界面时做，API 层 `SetRegion` 已就绪）
 - [ ] 验证 `Options.ExcludeWindows`（WDA_EXCLUDEFROMCAPTURE）在 17763 是否真不可用
@@ -530,3 +541,17 @@ Go_share_desktop/
     `cmd/pixprobe` 像素统计收口**，不要只信日志。
 13. **DXGI 首帧可能是未初始化的黑帧**（实测 2/3 次出现，两块屏都有）。第二帧起正常。
     修的时候注意：不能无条件丢首帧，否则桌面静止时观众永远等不到画面（R25）。
+
+### 阶段 3 新增的已知约束
+14. **pion 的 ICE 状态回调里不要做任何会等待 ICE 的动作**。回调跑在 ICE agent 的内部
+    goroutine 上，`peer.Close()` 要等 agent 收尾 → 互等死锁，分享端**静默卡死**
+    （无 panic 无日志，只有后续接入超时能看出来）。清理必须 `go cleanup(...)`（R27）。
+15. **幂等别用 `sync.Once`**：`cleanup → Server.Drop → closeFn → cleanup` 是同 goroutine
+    重入，`once.Do` 会永久阻塞。用 `mu + bool flag`，重入直接 return（R27）。
+16. **先摘记录、解锁、再回调**：`Server.Kick` 原来持 `s.mu` 调 closeFn，而 closeFn 会回头
+    调 `srv.Detach` → 同一把锁自锁。`Drop`（移除+回调）与 `Detach`（只移除）语义要分开，
+    分享端 cleanup 用 `Detach`（R28）。
+17. **观众被强杀时没有 Bye**，只能靠 ICE `disconnected` 超时兜底（5s）。实测有效：
+    强杀两个观众后分享端在 5s 内把它们回收成「剩余 0 人」。
+18. **验证接入功能时，观众进程必须用 `run_in_background` 起**。用 `cmd &` 起的话，
+    Bash 工具调用一返回子进程就被回收，会误判成"接入失败"或触发假的断线兜底路径。

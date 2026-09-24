@@ -125,6 +125,10 @@ func main() {
 	fmt.Printf("\n[7] 热切换采集区域（无感切换前提）\n")
 	checkHotSwitch(ctx, primary)
 
+	// ---------- 8. 首帧黑预热（R25） ----------
+	fmt.Printf("\n[8] 首帧黑预热（R25：DXGI 建流后首帧常是未初始化的黑帧）\n")
+	checkWarmup(ctx, primary)
+
 	fmt.Printf("\n")
 	hr()
 	fmt.Printf("结果: %d 通过 / %d 失败\n\n", pass, fail)
@@ -433,6 +437,53 @@ func checkHotSwitch(ctx context.Context, d capture.Display) {
 }
 
 // ---------- 辅助 ----------
+
+// checkWarmup 验证 R25 的修复：预热必须挡住首帧黑，且不能污染静止兜底帧。
+//
+// 刻意保留"不预热"的对照组：如果哪天 DXGI 不再产生黑帧，这一项会显示"对照组非黑"，
+// 说明预热成了多余动作（那时可以删掉它），而不是默默继续丢帧。
+func checkWarmup(ctx context.Context, d capture.Display) {
+	// A. 对照组：不预热直接取首帧
+	src, err := capture.NewSource(ctx, capture.Options{Display: d, FPS: 30})
+	if err != nil {
+		check("建立采集（对照组）", false, err.Error())
+		return
+	}
+	fctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	f, err := src.WaitFrame(fctx)
+	cancel()
+	rawBlack := err == nil && f.IsBlack()
+	fmt.Printf("     不预热：首帧 %dx%d 全黑=%v\n", f.W, f.H, rawBlack)
+	_ = src.Close()
+
+	// B. 预热后
+	src2, err := capture.NewSource(ctx, capture.Options{Display: d, FPS: 30})
+	if err != nil {
+		check("建立采集（预热）", false, err.Error())
+		return
+	}
+	defer src2.Close()
+	warmOK, _ := src2.Warmup(ctx, 3, 600*time.Millisecond)
+	fctx2, cancel2 := context.WithTimeout(ctx, 2*time.Second)
+	f2, err2 := src2.WaitFrame(fctx2)
+	cancel2()
+	if err2 != nil {
+		check("预热后取到帧", false, fmt.Sprintf("err=%v（桌面静止，属预期）", err2))
+		return
+	}
+	check("预热后首帧非黑", !f2.IsBlack(), fmt.Sprintf("%dx%d 预热命中=%v", f2.W, f2.H, warmOK))
+
+	last := src2.Last()
+	if last.Empty() {
+		fmt.Printf("     Last() 为空（桌面静止未出帧），跳过兜底帧检查\n")
+	} else {
+		check("预热未污染静止兜底帧 Last()", !last.IsBlack(),
+			"黑帧不得成为观众看到的第一帧")
+	}
+	if !rawBlack {
+		fmt.Printf("     ⚠️ 对照组首帧不是黑的 —— DXGI 行为可能已变，预热或许可以去掉\n")
+	}
+}
 
 func d2raw(ctx context.Context, d capture.Display) screencapture.Display {
 	ds, err := screencapture.Displays(ctx)
