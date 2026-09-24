@@ -160,6 +160,7 @@ type Shell struct {
 	btnStop     widget.Clickable
 	btnPause    widget.Clickable
 	btnPick     widget.Clickable
+	btnReRegion widget.Clickable
 	btnRegionOK widget.Clickable
 	btnRegionNo widget.Clickable
 	btnJoin     widget.Clickable
@@ -167,13 +168,19 @@ type Shell struct {
 	btnLeave    widget.Clickable
 	btnCodeCopy widget.Clickable
 	btnRotate   widget.Clickable
+	btnZoomFit  widget.Clickable
+	btnZoom100  widget.Clickable
 	addrCopies  []widget.Clickable
 	kickBtns    []widget.Clickable
 	foundBtns   []widget.Clickable
 	presetBtns  []widget.Clickable
+	dispBtns    []widget.Clickable
 
 	dispEnum  widget.Enum
 	presetEnm widget.Enum
+	// panelList 让分享中面板的"信息区"可滚动：观众一多面板就超高，
+	// 不滚动的话底部的"停止分享"会被推出窗口（实测 780 高窗口 + 2 个观众就放不下）。
+	panelList widget.List
 
 	edAddr widget.Editor
 	edCode widget.Editor
@@ -184,6 +191,21 @@ type Shell struct {
 	dragFrom image.Point
 	dragTo   image.Point
 	region   capture.Rect
+	// regionReturn 记录框选完成（或取消）后回到哪个页面：
+	// 设置页进来回设置页，分享中"换区域"进来回分享页。
+	regionReturn Route
+
+	// 观看端缩放（P0 #13）：
+	// zoom100=false 适配窗口（contain，可能缩小变糊）；
+	// zoom100=true  1:1 原始像素（清晰，画面比窗口大时可拖动平移）。
+	zoom100  bool
+	panTag   bool // 平移拖拽的 event.Tag
+	panning  bool
+	panFrom  image.Point // 按下时的指针位置（屏幕 px）
+	panBaseX int         // 按下时已有的平移量
+	panBaseY int
+	panX     int // 相对"居中位置"的平移量（屏幕 px）
+	panY     int
 
 	// 内部
 	selDisplay capture.Display
@@ -198,10 +220,11 @@ type Shell struct {
 // NewShell 创建外壳。displays 为空时调用方应先报错。
 func NewShell(cfg ShellConfig) *Shell {
 	s := &Shell{
-		cfg:     cfg,
-		frames:  make(chan *image.NRGBA, 2),
-		route:   RouteHome,
-		preview: nil,
+		cfg:          cfg,
+		frames:       make(chan *image.NRGBA, 2),
+		route:        RouteHome,
+		preview:      nil,
+		regionReturn: RouteSetup,
 	}
 	if len(cfg.Displays) > 0 {
 		s.selDisplay = cfg.Displays[0]
@@ -219,6 +242,9 @@ func NewShell(cfg ShellConfig) *Shell {
 	s.edCode.SingleLine = true
 	s.edAddr.SetText("")
 	s.edCode.SetText("")
+	// 框选页的显示器切换按钮（数量固定 = 显示器数量）。
+	s.dispBtns = make([]widget.Clickable, len(cfg.Displays))
+	s.panelList.Axis = layout.Vertical
 	return s
 }
 
@@ -313,6 +339,12 @@ func (s *Shell) SetRegionRect(r capture.Rect) {
 func (s *Shell) SetDragPreview(from, to image.Point) {
 	s.dragFrom = from
 	s.dragTo = to
+}
+
+// SetZoom100 直接设置观看端缩放模式（离屏校验用，界面里走按钮）。
+func (s *Shell) SetZoom100(on bool) {
+	s.zoom100 = on
+	s.panX, s.panY = 0, 0
 }
 
 // SetSetupNote 设置设置页提示（如"已选择区域 800×600"）。

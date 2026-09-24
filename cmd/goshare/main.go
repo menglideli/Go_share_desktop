@@ -54,6 +54,7 @@ func main() {
 	// 也是产品上的调优旋钮。
 	switchAt := flag.Duration("switch-at", 0, "分享开始 N 秒后热切换采集区域（自动化验证用，0 = 不切）")
 	switchRegion := flag.String("switch-region", "", "热切换到的区域，格式 宽x高+左+上（如 800x600+100+100）")
+	switchDisp := flag.Int("switch-display", -1, "分享开始 N 秒后热切换到第 N 台显示器（配合 -switch-at，-1 = 不换屏）")
 	keyInterval := flag.Duration("key-interval", 0, "稳态周期性全量帧间隔（0/负值=禁用，靠观众请求恢复）")
 	keyBurst := flag.Duration("key-burst", 3*time.Second, "新观众接入后的密集补帧窗口（负值禁用）")
 	flag.Parse()
@@ -91,6 +92,7 @@ func main() {
 		dumpPath: *dumpFrame, dumpAt: *dumpAt,
 		keyInterval: *keyInterval, keyBurst: *keyBurst,
 		switchAt: *switchAt, switchRegion: *switchRegion,
+		switchDisp: *switchDisp, displays: ds,
 	}
 	a.shell = ui.NewShell(ui.ShellConfig{
 		Title:    "GoShare · 内网桌面共享",
@@ -160,7 +162,12 @@ type app struct {
 	ann     *discover.Announcer
 	stop    context.CancelFunc
 	stopHUD chan struct{}
+	// shCtx 是本次分享的上下文（换屏时新建采集源要用它，保证停止分享时一起收掉）。
+	shCtx context.Context
 	region  capture.Rect
+	// display 是当前正在采集的显示器（换区域/换屏时对照用）。
+	display  capture.Display
+	displays []capture.Display
 	// HUD 增量统计用
 	lastFrames uint64
 	lastBytes  uint64
@@ -201,6 +208,15 @@ type app struct {
 	// （见 -switch-at / -switch-region）。
 	switchAt     time.Duration
 	switchRegion string
+	// switchDisp：自动化验证用，分享开始后热切换到另一台显示器（-switch-display）。
+	switchDisp int
+
+	// ---- 观看端断线重连 ----
+	// wAddr / wCode 是最近一次成功接入用的地址与授权码，断线自动重连用。
+	wAddr string
+	wCode string
+	// reconnecting 防止状态循环同时发起多个重连。
+	reconnecting atomic.Bool
 
 	// ---- 观看端画面完整性（R32）----
 	// needFull：当前画布不完整，需要一帧全量。初始为 true —— 观众在收到
@@ -254,6 +270,7 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 	// 本地回显：分享端自己也要看到在推什么（降采样到 ~960 宽，省 CPU）
 	a.mu.Lock()
 	a.region = opts.Region
+	a.display = opts.Display
 	a.view = ui.NewView(opts.Display.W, opts.Display.H, fitScale(opts.Display.W, opts.Display.H))
 	a.mu.Unlock()
 
@@ -415,6 +432,7 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 	a.srv = srv
 	a.ann = ann
 	a.stop = cancel
+	a.shCtx = shCtx
 	a.stopHUD = make(chan struct{})
 	a.lastFrames, a.lastBytes, a.lastSent, a.lastAt = 0, 0, 0, time.Now()
 	hudStop := a.stopHUD
@@ -450,6 +468,23 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 				a.mu.Lock()
 				a.region = r
 				a.mu.Unlock()
+			}()
+		}
+	}
+	// 自动化验证用：分享开始 N 秒后热切换到另一台显示器（跨屏，P1）。
+	// 走的是界面"更换区域 / 换屏"的同一条路（Sharer.SetDisplay）。
+	if a.switchAt > 0 && a.switchDisp >= 0 && a.switchDisp < len(a.displays) {
+		d := a.displays[a.switchDisp]
+		if d.ID != opts.Display.ID {
+			wait := a.switchAt
+			go func() {
+				select {
+				case <-time.After(wait):
+				case <-shCtx.Done():
+					return
+				}
+				log.Printf("自动化：热切换到显示器 %s（%dx%d）", d.Name, d.W, d.H)
+				a.applyDisplaySwitch(sh, d, capture.Rect{})
 			}()
 		}
 	}
@@ -538,9 +573,16 @@ func (a *app) pushShareState() {
 	regionText := "整屏"
 	a.mu.Lock()
 	r := a.region
+	dispName := a.display.Name
+	multiDisp := len(a.displays) > 1
 	a.mu.Unlock()
 	if !r.Empty() {
 		regionText = fmt.Sprintf("区域 %d×%d", r.W, r.H)
+	}
+	// 多屏机器上标出采的是哪块屏 —— 换屏之后 HUD 是唯一能看到
+	// "现在到底在分享哪台显示器"的地方，不写清楚用户只能猜。
+	if multiDisp && dispName != "" {
+		regionText = dispName + " · " + regionText
 	}
 
 	// Stats.EncodeMs 在 Stats() 里已经折算成**均值**（见 pipeline.Sharer.Stats），
@@ -599,6 +641,7 @@ func (a *app) stopShare() {
 	hadSession := a.sh != nil || a.srv != nil
 	sh, srv, ann, cancel, hudStop := a.sh, a.srv, a.ann, a.stop, a.stopHUD
 	a.sh, a.srv, a.ann, a.stop, a.stopHUD = nil, nil, nil, nil, nil
+	a.shCtx = nil
 	a.view = nil
 	a.mu.Unlock()
 
@@ -703,6 +746,38 @@ func (a *app) pickRegionSnapshot(d capture.Display) *image.NRGBA {
 
 func (a *app) regionDone(r capture.Rect, ok bool) {
 	a.mu.Lock()
+	sh := a.sh
+	a.mu.Unlock()
+
+	// 分享中进来（"更换区域 / 换屏"）：热切换，不动设置页的状态。
+	if sh != nil {
+		if !ok {
+			return
+		}
+		d := a.shell.SelectedDisplay()
+		a.mu.Lock()
+		sameDisp := d.ID == a.display.ID
+		a.mu.Unlock()
+		if sameDisp {
+			log.Printf("界面换区域：%dx%d+%d+%d（整屏=%v）", r.W, r.H, r.X, r.Y, r.Empty())
+			sh.SetRegion(r)
+			a.mu.Lock()
+			a.region = r
+			a.mu.Unlock()
+		} else {
+			log.Printf("界面换屏：%s（%dx%d）区域 %dx%d+%d+%d", d.Name, d.W, d.H, r.W, r.H, r.X, r.Y)
+			a.applyDisplaySwitch(sh, d, r)
+		}
+		a.pushShareState()
+		if r.Empty() {
+			a.shell.Toast("已切换为整屏分享")
+		} else {
+			a.shell.Toast(fmt.Sprintf("已切换分享区域 %d×%d", r.W, r.H))
+		}
+		return
+	}
+
+	a.mu.Lock()
 	if ok {
 		a.region = r
 	}
@@ -712,6 +787,30 @@ func (a *app) regionDone(r capture.Rect, ok bool) {
 	} else {
 		a.shell.SetSetupNote("")
 	}
+}
+
+// applyDisplaySwitch 热切换采集显示器：换源、更新本地状态、重建预览视图。
+//
+// 预览视图必须跟着重建：它按"显示器宽高"建的，换了屏还用旧尺寸，
+// 本地回显会按错的比例缩放甚至越界。
+func (a *app) applyDisplaySwitch(sh *pipeline.Sharer, d capture.Display, r capture.Rect) {
+	a.mu.Lock()
+	shCtx := a.shCtx
+	a.mu.Unlock()
+	if shCtx == nil {
+		return
+	}
+	if err := sh.SetDisplay(shCtx, d, r); err != nil {
+		log.Printf("换屏失败：%v（保持原显示器）", err)
+		a.shell.Toast("换屏失败：" + err.Error())
+		return
+	}
+	a.mu.Lock()
+	a.display = d
+	a.region = r
+	a.view = ui.NewView(d.W, d.H, fitScale(d.W, d.H))
+	a.mu.Unlock()
+	log.Printf("已切换到显示器 %s（%dx%d）", d.Name, d.W, d.H)
 }
 
 // ---------------------------------------------------------------------------
@@ -764,12 +863,13 @@ func (a *app) join(addr, code string) {
 			a.shell.SetJoinState(ui.JoinState{Err: "接入失败：" + err.Error() + hint})
 			return
 		}
-		a.mu.Lock()
-		a.sess = sess
-		a.mu.Unlock()
-		log.Printf("已接入 %s（%s）· 握手 %.0f ms", sess.Info.Name, addr, sess.ConnectMs)
-		a.shell.Go(ui.RouteViewing)
-		go a.watchStatusLoop()
+	a.mu.Lock()
+	a.sess = sess
+	a.wAddr, a.wCode = addr, code
+	a.mu.Unlock()
+	log.Printf("已接入 %s（%s）· 握手 %.0f ms", sess.Info.Name, addr, sess.ConnectMs)
+	a.shell.Go(ui.RouteViewing)
+	go a.watchStatusLoop(dec)
 	}()
 }
 
@@ -794,12 +894,20 @@ func (a *app) dialOnce(dec *codec.Decoder, addr, code string) (*signal.Session, 
 				// OnState 只做记录与打日志 —— 它跑在 ICE agent 的内部 goroutine 上，
 				// 任何会等待 ICE 的动作（尤其是 Close）都会和 agent 收尾互等死锁，
 				// 表现为进程静默卡死（PLAN 约束 8）。
-				OnState: func(st webrtc.ICEConnectionState) {
-					prev := webrtc.ICEConnectionState(a.wICE.Swap(int32(st)))
-					if prev != st {
-						log.Printf("观看连接状态：%v → %v", prev, st)
-					}
-				},
+			OnState: func(st webrtc.ICEConnectionState) {
+				prev := webrtc.ICEConnectionState(a.wICE.Swap(int32(st)))
+				if prev != st {
+					log.Printf("观看连接状态：%v → %v", prev, st)
+				}
+				// ICE 自愈（disconnected/failed → connected）：抖动期间可能丢过
+				// 全量帧的分片，画布上缺的块不会自己回来（增量只覆盖变化区域）——
+				// 主动请一帧全量，别等观众盯着残影自己发现。
+				if (prev == webrtc.ICEConnectionStateDisconnected || prev == webrtc.ICEConnectionStateFailed) &&
+					(st == webrtc.ICEConnectionStateConnected || st == webrtc.ICEConnectionStateCompleted) {
+					log.Printf("连接自愈，请求全量帧刷新画布")
+					a.needFull.Store(true)
+				}
+			},
 				OnFrame: func(f *codec.Frame) {
 					a.wLastFrameAt.Store(time.Now().UnixNano())
 					img, err := dec.Decode(f)
@@ -852,7 +960,58 @@ func (a *app) dialOnce(dec *codec.Decoder, addr, code string) (*signal.Session, 
 	return sess, nil
 }
 
-func (a *app) watchStatusLoop() {
+// reconnect 断线后自动重连：同一地址同一授权码，每 4s 一次、最多 12 次。
+//
+// 为什么值得做：对方重启分享、网络抖动恢复都是常态，让用户手动回到
+// 接入页重新输一遍地址授权码，体验是断的。重连成功后 needFull 置位，
+// 第一帧全量到达前会主动 PLI —— 画面从"完整"开始，而不是从残影拼回来（R32）。
+//
+// dead 是触发重连时的那个会话：期间用户退出观看或手动重连都会换掉
+// a.sess，发现换了就立即收手（连成了也礼貌关闭）。
+func (a *app) reconnect(dec *codec.Decoder, dead *signal.Session) {
+	defer a.reconnecting.Store(false)
+	// 旧 peer 已经死了，立刻关掉释放资源。不能等重连成功再关：
+	// 它的 OnState(closed) 会把刚建好的新会话的 wICE 覆盖成 closed，
+	// 状态循环会误判"新会话也断了"，把健康会话再杀一次。
+	_ = dead.Peer.Close()
+	for attempt := 1; attempt <= 12; attempt++ {
+		a.mu.Lock()
+		cur := a.sess
+		addr, code := a.wAddr, a.wCode
+		a.mu.Unlock()
+		if cur != dead {
+			return
+		}
+		log.Printf("自动重连 %s（第 %d/12 次）…", addr, attempt)
+		sess, err := a.dialOnce(dec, addr, code)
+		if err != nil {
+			log.Printf("自动重连失败：%v", err)
+			select {
+			case <-time.After(4 * time.Second):
+			case <-a.ctx.Done():
+				return
+			}
+			continue
+		}
+		a.mu.Lock()
+		if a.sess != dead {
+			a.mu.Unlock()
+			_ = sess.ByeClose()
+			return
+		}
+		a.sess = sess
+		a.wFrames, a.wBytes, a.wStart, a.wDec = 0, 0, time.Now(), 0
+		a.mu.Unlock()
+		a.peerBox.Store(sess.Peer)
+		a.needFull.Store(true)
+		a.lastFrag.Store(0)
+		log.Printf("自动重连成功（%s），已请求全量帧", sess.Info.Name)
+		return
+	}
+	log.Printf("自动重连 12 次都失败，放弃（可回到接入页手动重连）")
+}
+
+func (a *app) watchStatusLoop(dec *codec.Decoder) {
 	t := time.NewTicker(500 * time.Millisecond)
 	defer t.Stop()
 	ticks := 0
@@ -901,8 +1060,13 @@ func (a *app) watchStatusLoop() {
 			downTicks++
 			switch {
 			case downTicks >= 3:
-				js.Notice = fmt.Sprintf("连接已断开（%v）—— 对方可能已停止分享，或网络中断", ice)
+				js.Notice = fmt.Sprintf("连接已断开（%v）—— 正在自动重连，也可退出后手动连接", ice)
 				js.NoticeWarn = true
+				// 持续断开 → 后台自动重连（同一地址/授权码，限 12 次）。
+				// CAS 保证同一时间只有一个重连在进行。
+				if a.reconnecting.CompareAndSwap(false, true) {
+					go a.reconnect(dec, sess)
+				}
 			case lastNotice != "":
 				// 防抖期内**沿用**上一条提示，不要凭空清空。
 				// 清空会让下面那句"提示已清除"的日志谎报"画面恢复正常" ——

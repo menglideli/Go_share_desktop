@@ -46,9 +46,10 @@ func (s *Shell) handleEvents(gtx layout.Context) {
 				_ = i
 			}
 		}
-		if s.btnPick.Clicked(gtx) {
-			if s.cfg.OnPickRegion != nil {
-				snap := s.cfg.OnPickRegion(s.selDisplay)
+	if s.btnPick.Clicked(gtx) {
+		if s.cfg.OnPickRegion != nil {
+			s.regionReturn = RouteSetup
+			snap := s.cfg.OnPickRegion(s.selDisplay)
 				if snap == nil {
 					s.Toast("抓取桌面快照失败")
 				} else {
@@ -103,6 +104,21 @@ func (s *Shell) handleEvents(gtx layout.Context) {
 			s.Toast("授权码已轮换")
 			_ = s.cfg.OnRotate()
 		}
+		// 换区域：复用框选页，但确认后回分享页并热切换（业务侧在
+		// OnRegionDone 里判断"正在分享"走 SetRegion/SetDisplay）。
+		if s.btnReRegion.Clicked(gtx) && s.cfg.OnPickRegion != nil {
+			s.regionReturn = RouteSharing
+			snap := s.cfg.OnPickRegion(s.selDisplay)
+			if snap == nil {
+				s.Toast("抓取桌面快照失败")
+			} else {
+				s.SetSnapshot(snap)
+				s.dragFrom = image.Point{}
+				s.dragTo = image.Point{}
+				s.dragging = false
+				s.Go(RouteRegion)
+			}
+		}
 		s.pickAddrCopy(gtx)
 		s.pickKick(gtx)
 		s.pickPreset(gtx)
@@ -132,19 +148,45 @@ func (s *Shell) handleEvents(gtx layout.Context) {
 			}
 			s.Go(RouteHome)
 		}
+		if s.btnZoomFit.Clicked(gtx) {
+			s.zoom100 = false
+			s.panX, s.panY = 0, 0
+		}
+		if s.btnZoom100.Clicked(gtx) {
+			s.zoom100 = true
+			s.panX, s.panY = 0, 0
+		}
 
 	case RouteRegion:
 		if s.btnRegionOK.Clicked(gtx) {
 			if s.cfg.OnRegionDone != nil {
 				s.cfg.OnRegionDone(s.region, s.region.W > 8 && s.region.H > 8)
 			}
-			s.Go(RouteSetup)
+			s.Go(s.regionReturn)
 		}
 		if s.btnRegionNo.Clicked(gtx) {
 			if s.cfg.OnRegionDone != nil {
 				s.cfg.OnRegionDone(capture.Rect{}, false)
 			}
-			s.Go(RouteSetup)
+			s.Go(s.regionReturn)
+		}
+		// 框选页顶部可切换显示器（跨屏分享用）：切换后重新抓快照。
+		for i := range s.dispBtns {
+			if i < len(s.cfg.Displays) && s.dispBtns[i].Clicked(gtx) {
+				d := s.cfg.Displays[i]
+				if d.ID != s.selDisplay.ID {
+					s.selDisplay = d
+					if s.cfg.OnPickRegion != nil {
+						if snap := s.cfg.OnPickRegion(d); snap != nil {
+							s.SetSnapshot(snap)
+							s.dragFrom = image.Point{}
+							s.dragTo = image.Point{}
+							s.dragging = false
+							s.region = capture.Rect{}
+						}
+					}
+				}
+			}
 		}
 	}
 }
@@ -491,6 +533,12 @@ func (s *Shell) pageSharing(gtx layout.Context, th *material.Theme) layout.Dimen
 			gtx.Constraints.Min.X = gtx.Constraints.Max.X
 			return layout.UniformInset(unit.Dp(16)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+					// 信息区可滚动：观众一多面板就超高，固定布局会把底部的
+					// "停止分享"推出窗口（实测 780 高 + 2 个观众就放不下）。
+					// 操作区固定在底部，任何时候都够得着。
+					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+						return s.panelList.Layout(gtx, 1, func(gtx layout.Context, _ int) layout.Dimensions {
+							return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 					// 授权码
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 						return s.section(gtx, th, "授权码", func(gtx layout.Context) layout.Dimensions {
@@ -603,8 +651,11 @@ func (s *Shell) pageSharing(gtx layout.Context, th *material.Theme) layout.Dimen
 							return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
 						})
 					}),
-					layout.Rigid(vSpace(16)),
-					// 操作
+							)
+						})
+					}),
+					layout.Rigid(vSpace(12)),
+					// 操作（固定底部，不随信息区滚动）
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 						pauseTxt := "暂停分享"
 						if st.Paused {
@@ -619,10 +670,19 @@ func (s *Shell) pageSharing(gtx layout.Context, th *material.Theme) layout.Dimen
 								b.CornerRadius = unit.Dp(8)
 								return b.Layout(gtx)
 							}),
-							layout.Rigid(vSpace(8)),
-							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-								gtx.Constraints.Min.X = gtx.Constraints.Max.X
-								b := material.Button(th, &s.btnRotate, "轮换授权码")
+						layout.Rigid(vSpace(8)),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							gtx.Constraints.Min.X = gtx.Constraints.Max.X
+							b := material.Button(th, &s.btnReRegion, "更换区域 / 换屏")
+							b.Background = colPanel
+							b.Color = colText
+							b.CornerRadius = unit.Dp(8)
+							return b.Layout(gtx)
+						}),
+						layout.Rigid(vSpace(8)),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							gtx.Constraints.Min.X = gtx.Constraints.Max.X
+							b := material.Button(th, &s.btnRotate, "轮换授权码")
 								b.Background = colPanel
 								b.Color = colText
 								b.CornerRadius = unit.Dp(8)
@@ -801,16 +861,29 @@ func (s *Shell) pageViewing(gtx layout.Context, th *material.Theme) layout.Dimen
 			m := op.Record(gtx.Ops)
 			gtx.Constraints.Min = image.Point{}
 			inner := layout.UniformInset(unit.Dp(10)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+				return 				layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 						txt := js.Status
 						if txt == "" {
 							txt = "观看中"
 						}
+						if s.zoom100 {
+							txt += " · 1:1（拖动平移）"
+						}
 						l := material.Body2(th, txt)
 						l.Color = colText
 						return l.Layout(gtx)
 					}),
+					// 缩放模式（P0 #13）：适配会按比例缩小画面，小字会糊；
+					// 1:1 保留原始像素，画面比窗口大时拖动平移查看。
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return s.zoomBtn(gtx, th, &s.btnZoomFit, "适配", !s.zoom100)
+					}),
+					layout.Rigid(hSpace(6)),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return s.zoomBtn(gtx, th, &s.btnZoom100, "1:1", s.zoom100)
+					}),
+					layout.Rigid(hSpace(10)),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 						b := material.Button(th, &s.btnLeave, "退出观看")
 						b.Background = colPanel
@@ -830,15 +903,70 @@ func (s *Shell) pageViewing(gtx layout.Context, th *material.Theme) layout.Dimen
 		}),
 		// 画面
 		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-			stack := clip.Rect(image.Rectangle{Max: gtx.Constraints.Max}).Push(gtx.Ops)
+			win := gtx.Constraints.Max
+			stack := clip.Rect(image.Rectangle{Max: win}).Push(gtx.Ops)
 			paint.Fill(gtx.Ops, color.NRGBA{R: 0, G: 0, B: 0, A: 255})
+
+			// 1:1 模式下接收拖动平移（适配模式不需要，整图总在视野内）。
+			// 事件必须在布局过程里收集 —— 与框选页同一套写法。
+			if s.zoom100 {
+				event.Op(gtx.Ops, &s.panTag)
+				for {
+					ev, ok := gtx.Event(pointer.Filter{
+						Target: &s.panTag,
+						Kinds:  pointer.Press | pointer.Drag | pointer.Release | pointer.Cancel,
+					})
+					if !ok {
+						break
+					}
+					e, ok := ev.(pointer.Event)
+					if !ok {
+						continue
+					}
+					p := image.Pt(int(e.Position.X*gtx.Metric.PxPerDp), int(e.Position.Y*gtx.Metric.PxPerDp))
+					switch e.Kind {
+					case pointer.Press:
+						s.panning = true
+						s.panFrom = p
+						s.panBaseX, s.panBaseY = s.panX, s.panY
+					case pointer.Drag:
+						if s.panning {
+							s.panX = s.panBaseX + p.X - s.panFrom.X
+							s.panY = s.panBaseY + p.Y - s.panFrom.Y
+						}
+					case pointer.Release, pointer.Cancel:
+						s.panning = false
+					}
+				}
+			}
+
 			if img != nil && !img.Bounds().Empty() {
-				widget.Image{
-					Src:      paint.NewImageOp(img),
-					Fit:      widget.Contain,
-					Position: layout.Center,
-					Scale:    1 / gtx.Metric.PxPerDp,
-				}.Layout(gtx)
+				if s.zoom100 {
+					// 1:1 原始像素：先按居中算基准，再叠加平移量并夹取，
+					// 保证画面边缘不被拖出黑边（小图则允许在窗口内移动）。
+					iw, ih := img.Bounds().Dx(), img.Bounds().Dy()
+					ox := (win.X-iw)/2 + s.panX
+					oy := (win.Y-ih)/2 + s.panY
+					ox = clampi(ox, mini(0, win.X-iw), maxi(0, win.X-iw))
+					oy = clampi(oy, mini(0, win.Y-ih), maxi(0, win.Y-ih))
+					// 夹取结果写回：窗口尺寸变化后平移量不会残留越界
+					s.panX = ox - (win.X-iw)/2
+					s.panY = oy - (win.Y-ih)/2
+					off := op.Offset(image.Pt(ox, oy)).Push(gtx.Ops)
+					widget.Image{
+						Src:   paint.NewImageOp(img),
+						Fit:   widget.Unscaled,
+						Scale: 1 / gtx.Metric.PxPerDp,
+					}.Layout(gtx)
+					off.Pop()
+				} else {
+					widget.Image{
+						Src:      paint.NewImageOp(img),
+						Fit:      widget.Contain,
+						Position: layout.Center,
+						Scale:    1 / gtx.Metric.PxPerDp,
+					}.Layout(gtx)
+				}
 			} else {
 				layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					l := material.Body1(th, "等待画面…")
@@ -997,6 +1125,38 @@ func (s *Shell) pageRegion(gtx layout.Context, th *material.Theme) layout.Dimens
 	}
 	area.Pop()
 
+	// 顶部显示器切换（多屏时才显示）：换屏 = 换快照 + 坐标系。
+	if len(s.cfg.Displays) > 1 {
+		layout.N.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.UniformInset(unit.Dp(12)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				children := make([]layout.FlexChild, 0, len(s.cfg.Displays)*2+2)
+				children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return s.chip(gtx, th, "采集哪块屏：", colPanel)
+				}))
+				children = append(children, layout.Rigid(hSpace(8)))
+				for i, d := range s.cfg.Displays {
+					i, d := i, d
+					children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						sel := d.ID == s.selDisplay.ID
+						bg := colPanel
+						fg := colText
+						if sel {
+							bg = colAccent
+							fg = color.NRGBA{R: 255, G: 255, B: 255, A: 255}
+						}
+						b := material.Button(th, &s.dispBtns[i], fmt.Sprintf("%s %d×%d", d.Name, d.W, d.H))
+						b.Background = bg
+						b.Color = fg
+						b.CornerRadius = unit.Dp(8)
+						return b.Layout(gtx)
+					}))
+					children = append(children, layout.Rigid(hSpace(8)))
+				}
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx, children...)
+			})
+		})
+	}
+
 	// 底部操作条
 	return layout.S.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.UniformInset(unit.Dp(20)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -1062,6 +1222,47 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func mini(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxi(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// clampi 把 v 夹到 [lo, hi]。
+func clampi(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// zoomBtn 画观看端的缩放模式切换小按钮（选中高亮）。
+func (s *Shell) zoomBtn(gtx layout.Context, th *material.Theme, c *widget.Clickable, txt string, sel bool) layout.Dimensions {
+	b := material.Button(th, c, txt)
+	if sel {
+		b.Background = colAccent
+		b.Color = color.NRGBA{R: 255, G: 255, B: 255, A: 255}
+	} else {
+		b.Background = colBG
+		b.Color = colText
+	}
+	b.CornerRadius = unit.Dp(6)
+	b.TextSize = unit.Sp(12)
+	b.Inset = layout.UniformInset(unit.Dp(4))
+	return b.Layout(gtx)
 }
 
 // vSpace / hSpace 生成间距。

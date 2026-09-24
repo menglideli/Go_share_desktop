@@ -241,6 +241,12 @@ func cases() []testCase {
 			s.SetJoinState(ui.JoinState{Status: "GKYN20230046 · 29.4 fps · 7.1 Mbps · 解码 4.9 ms"})
 			s.SetLastFrame(synth(960, 540))
 		}},
+		{name: "viewing-zoom", setup: func(s *ui.Shell) {
+			s.SetJoinState(ui.JoinState{Status: "GKYN20230046 · 29.4 fps · 7.1 Mbps · 解码 4.9 ms"})
+			// 1:1 模式：画面比窗口大（只显示局部、可平移），原始像素不缩放
+			s.SetLastFrame(synth(1920, 1080))
+			s.SetZoom100(true)
+		}},
 		{name: "region", setup: func(s *ui.Shell) {
 			s.SetSnapshot(synth(1440, 900))
 			// 模拟"拖到一半"的状态：拖拽框 + 已算出的桌面区域
@@ -292,7 +298,7 @@ func routeOf(name string) ui.Route {
 		return ui.RouteSharing
 	case "join", "join-error":
 		return ui.RouteJoin
-	case "viewing":
+	case "viewing", "viewing-zoom":
 		return ui.RouteViewing
 	case "region":
 		return ui.RouteRegion

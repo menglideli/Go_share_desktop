@@ -127,7 +127,10 @@ type Stats struct {
 // Sharer 是一条分享管线：单采集、单编码、扇出给多个观众。
 type Sharer struct {
 	cfg Config
-	src *capture.Source
+	// src 用原子指针：Run 的 WaitFrame 可能阻塞很久（桌面静止时几秒不出帧），
+	// 跨屏热切换（SetDisplay）若持锁等它就会卡死。换源 = 建新源 → 原子换 → 关旧源，
+	// Run 每轮循环重新取指针，最多少发一帧旧画面，编码器按新尺寸自重配置。
+	src atomic.Pointer[capture.Source]
 	enc *codec.Encoder
 
 	mu    sync.Mutex
@@ -168,25 +171,57 @@ func NewSharer(ctx context.Context, cfg Config) (*Sharer, error) {
 	if cfg.Warmup >= 0 {
 		_, _ = src.Warmup(ctx, 3, cfg.Warmup)
 	}
-	return &Sharer{
+	sh := &Sharer{
 		cfg:       cfg,
-		src:       src,
 		enc:       codec.NewEncoder(codec.Config{Quality: cfg.Preset.Quality, Tiles: cfg.Preset.Tiles, Dirty: cfg.Preset.Dirty}),
 		peers:     map[*rtc.Peer]struct{}{},
 		lastKeyAt: time.Now(),
-	}, nil
+	}
+	sh.src.Store(src)
+	return sh, nil
 }
 
 // Source 返回底层采集源。
-func (s *Sharer) Source() *capture.Source { return s.src }
+func (s *Sharer) Source() *capture.Source { return s.src.Load() }
 
 // Close 停止采集。
-func (s *Sharer) Close() error { return s.src.Close() }
+func (s *Sharer) Close() error { return s.src.Load().Close() }
 
 // SetRegion 热切换采集区域（分辨率不变时编码器不重建 → 无感切换）。
 func (s *Sharer) SetRegion(r capture.Rect) {
-	s.src.SetRegion(r)
+	s.src.Load().SetRegion(r)
 	s.enc.ForceKeyFrame()
+}
+
+// SetDisplay 热切换到另一台显示器（跨屏）。
+//
+// 为什么不能复用 SetRegion：采集流绑定在显示器上，换屏必须重建 capture.Source
+// （新显示器可能分辨率、DPI 缩放都不同，光标坐标原点也跟着变）。
+//
+// 顺序是"先建好新源再换"：新建/预热可能花几百毫秒甚至失败，这段时间旧源照常出帧，
+// 观众无感；反过来"先关旧再建新"会让观众看到一段黑。预热同样不能省 ——
+// DXGI 首帧常是未初始化黑帧（R25），换屏后观众第一眼不能是黑的。
+func (s *Sharer) SetDisplay(ctx context.Context, d capture.Display, r capture.Rect) error {
+	src, err := capture.NewSource(ctx, capture.Options{
+		Display: d,
+		Region:  r,
+		FPS:     s.cfg.FPS,
+		Cursor:  s.cfg.Cursor,
+	})
+	if err != nil {
+		return err
+	}
+	if s.cfg.Warmup >= 0 {
+		_, _ = src.Warmup(ctx, 3, s.cfg.Warmup)
+	}
+	old := s.src.Swap(src)
+	if old != nil {
+		// 旧源的 WaitFrame 可能还在阻塞：Close 会让它报错返回，Run 下一轮取到新源。
+		_ = old.Close()
+	}
+	// 尺寸大概率变了：全量帧让观众画布整体重建，避免 dirty 增量只盖一部分（R32 同类）。
+	s.enc.ForceKeyFrame()
+	return nil
 }
 
 // AddPeer 加入一个观众。新观众会触发一次全量帧，保证秒开。
@@ -317,7 +352,7 @@ func (s *Sharer) SetPaused(on bool) {
 
 // blackFrame 返回一帧纯黑画面（按当前采集区域尺寸）。
 func (s *Sharer) blackFrame() capture.Frame {
-	r := s.src.Region()
+	r := s.src.Load().Region()
 	n := r.W * r.H * 4
 	if n <= 0 {
 		return capture.Frame{}
@@ -337,7 +372,7 @@ func (s *Sharer) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.stats
-	st.Stats = s.src.Stats()
+	st.Stats = s.src.Load().Stats()
 	if st.Frames > 0 {
 		st.EncodeMs /= float64(st.Frames)
 	}
@@ -375,18 +410,18 @@ func (s *Sharer) Run(ctx context.Context) error {
 			}
 			// 仍要用带超时的等待，否则 ctx 取消要等到下一次桌面变化才响应。
 			c, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-			_, _ = s.src.WaitFrame(c)
+			_, _ = s.src.Load().WaitFrame(c)
 			cancel()
 			continue
 		}
-		f, err := s.src.WaitFrame(ctx)
+		f, err := s.src.Load().WaitFrame(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			// 等待超时 = 桌面没变化。发一次保活心跳，让观众端知道连接还活着。
 			if time.Since(lastBeat) >= s.cfg.IdleHeartbeat && s.PeerCount() > 0 {
-				if hb := s.src.Last(); !hb.Empty() {
+				if hb := s.src.Load().Last(); !hb.Empty() {
 					_ = s.emit(hb)
 					s.mu.Lock()
 					s.stats.Heartbeat++
