@@ -74,6 +74,13 @@
 24. **同一文件的多个编辑不要并行下发**：会互相覆盖，且 `go build` 通过、接口对得上，
     只是改动被**静默丢弃**（本轮"出网码率恒为 0.00"，看代码"明明改了"）。
     改完必须 grep 回来确认落地，不能只看编辑工具返回成功。
+27. **Win32 位图 API 在 gdi32.dll，不在 user32**（`CreateDIBSection`/`CreateBitmap`）。
+    `LazyProc` 挂错 DLL 是 `mustFind` **panic 崩进程**（崩在 goroutine 里，
+    build/vet 全绿发现不了）—— 新 syscall 封装第一次必须真跑。
+28. **`.ps1` 必须纯 ASCII**：PowerShell 5.1 把无 BOM 的 .ps1 按 ANSI(GBK) 读，
+    中文字节序列会吞掉引号直接炸解析器（报错还乱码看不出哪行）。
+29. **改完代码必须重新构建 dist 再验证**：拿修复前的旧二进制复测，panic 堆栈行号
+    对新代码完全对不上。验证前先核对"二进制构建时间 vs 最后改动时间"。
 
 ## 文档入口
 
@@ -96,6 +103,7 @@
 | `internal/signal` | HTTP 信令、授权码、观众管理（Drop/Detach） |
 | `internal/discover` | UDP 广播自动发现 |
 | `internal/clip` | 剪贴板一键复制（纯 syscall） |
+| `internal/tray` | 系统托盘（纯 syscall：message-only 窗口 + 独立消息循环；图标程序化绘制） |
 
 ## 常用验证工具（`cmd/`）
 
