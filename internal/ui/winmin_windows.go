@@ -24,6 +24,7 @@ import (
 // GetWindowThreadProcessId，ShowWindow / GetWindow / SetWindowDisplayAffinity 得自己取。
 const (
 	swMinimize = 6 // SW_MINIMIZE
+	swRestore  = 9 // SW_RESTORE
 	wdaMonitor = 1 // WDA_MONITOR
 	gwOwner    = 4 // GW_OWNER
 )
@@ -34,6 +35,7 @@ var (
 	procIsIconic                 = user32.NewProc("IsIconic")
 	procGetWindow                = user32.NewProc("GetWindow")
 	procSetWindowDisplayAffinity = user32.NewProc("SetWindowDisplayAffinity")
+	procSetForegroundWindow      = user32.NewProc("SetForegroundWindow")
 )
 
 // ownMainWindow 找出本进程的可见顶层窗口，也就是 Gio 的主窗。
@@ -104,5 +106,25 @@ func MinimizeMainWindow() error {
 			return fmt.Errorf("ui: ShowWindow(SW_MINIMIZE) 未生效：%v", e)
 		}
 	}
+	return nil
+}
+
+// RestoreMainWindow 把主窗从最小化恢复并抢到前台（托盘「显示主窗口」用）。
+//
+// 与 MinimizeMainWindow 同一个坑：调用方不要跑在 Gio 事件回调里
+// （托盘回调本来就是独立 goroutine，天然满足）。
+//
+// ⚠️ ownMainWindow 只认"可见"顶层窗——最小化的窗口 WS_VISIBLE 位仍在
+// （见上面的注释），所以最小化状态下照样能找到，不用担心。
+func RestoreMainWindow() error {
+	h, err := ownMainWindow()
+	if err != nil {
+		return err
+	}
+	procShowWindow.Call(uintptr(h), swRestore)
+	// 从托盘（另一个进程的输入上下文之外）抢前台，Windows 常会拒绝
+	// SetForegroundWindow —— 但先 SW_RESTORE 再调它的组合在实测里能工作，
+	// 失败也无害（窗口已还原，只是没置顶），所以不检查返回值。
+	procSetForegroundWindow.Call(uintptr(h))
 	return nil
 }

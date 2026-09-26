@@ -1072,3 +1072,57 @@ e2e46 的日志里出现：
 **后台进程启动有 30~90s 延迟**：e2e53/e2e54 两轮因为"host 已死、观众进程才起来"
 而作废（`run_in_background` 返回只说明任务受理，不说明进程在跑）。
 确定性做法：长寿命 host + 手动按 PID 杀来控制时序（e2e55 就是这么过的）。
+
+---
+
+## 18. 阶段 6（2026-09-26）：打包分发 —— 托盘 / 单 exe / 使用说明
+
+### 18.1 系统托盘（internal/tray，纯 syscall，CGO_ENABLED=0）
+
+设计：message-only 隐藏窗口（父窗口 HWND_MESSAGE）跑在独立的 LockOSThread goroutine
+里处理托盘回调与菜单；图标用 `CreateDIBSection` + `CreateIconIndirect` **程序化绘制**
+（`tray.PaintIcon`，与 exe 资源图标同一份代码，`go run` 与发布构建视觉一致）。
+菜单每次右键现建现销（状态来自原子量，避免跨线程 EnableMenuItem 的同步问题）；
+业务回调一律 `go` 出窗口过程，不阻塞托盘消息循环。
+
+像素证据（cmd/traytest + shot 截屏）：
+- 菜单三项「显示主窗口 / 停止分享 / 退出」渲染正确，**「停止分享」在
+  SetSharing(true) 后可用**（非灰）——见 out/tray-menu.png（2026-09-26 12:59）。
+- `tray.New` 成功（NIM_ADD 返回 TRUE）、`Close` 后进程正常退出无泄漏。
+- 图标默认进溢出面板（"^"）——Windows 对新图标的默认策略，非缺陷。
+
+**踩坑（约束 51）**：`CreateDIBSection`/`CreateBitmap` 在 **gdi32.dll**，第一版挂到
+user32 上，`LazyProc.mustFind` **直接 panic 崩进程**（崩在 goroutine 里，
+build/vet 全绿发现不了）。新 syscall 封装第一次必须真跑。
+
+### 18.2 单 exe 构建（scripts/build.ps1）
+
+链路：`cmd/icon`（多尺寸 PNG + ICO，复用 `tray.PaintIcon` + x/image/draw 缩放）
+→ `go-winres make`（图标 + 中文版本信息 + **PerMonitorV2 DPI manifest**）
+→ `go build -H windowsgui -s -w -X main.version=...`。
+产物 `dist/goshare-v0.6.0-windows-amd64.exe`，**17.7 MB**。
+
+冒烟证据（out/dist-smoke.png + dist-smoke.log）：
+- 标题栏「GoShare · 内网桌面共享 **v0.6.0**」（版本注入生效）、窗口左上蓝圆图标、
+  任务栏蓝圆图标（exe 资源被 Gio/Windows 用作窗口图标）。
+- **无控制台窗口**（windowsgui 生效）；日志无 DPI 警告（manifest 直接生效，
+  `EnsureDPIAware` 的 E_ACCESSDENIED 路径早就兼容）。
+- 版本信息 0804 中文条目正确读出（FileDescription = "GoShare · 内网桌面共享"）。
+- windowsgui 下启动失败有 `ui.AlertError` MessageBox 兜底（stderr 不可见的场景）。
+
+**踩坑（约束 53）**：dist 冒烟第一跑用了 gdi32 修复**前**的旧二进制，panic 行号
+对新代码完全对不上 —— 验证前先核对"二进制构建时间 vs 最后改动时间"。
+**踩坑（约束 52）**：构建脚本带中文被系统自带 ps1 解释器按 ANSI 解析直接炸，
+build.ps1 重写为纯 ASCII。
+
+### 18.3 使用说明（README.md）
+
+快速开始（分享/观看各 3~4 步）· 分享中操作表 · **防火墙一节**（首次弹窗勾选
+「专用网络」+ 三条 netsh 命令 + 端口表：TCP 9000 信令 / UDP 50000-50100 媒体 /
+UDP 45921 发现）· 常见问题（连不上/全黑/卡顿/光标）· 参数表 · 构建与自检。
+
+### 18.4 回归
+
+capcheck 12/12 · codeccheck 14/14 · sigcheck 29/29 · uicheck -golden **9/9（基线差
+0.000%**，渲染路径未动）· go vet 全绿。阶段 6 未触碰采集/编码/传输/渲染路径，
+回归一次通过。

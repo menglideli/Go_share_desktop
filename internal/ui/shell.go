@@ -142,6 +142,10 @@ type Shell struct {
 	share  ShareState
 	join   JoinState
 	route  Route
+	// closeFn 是 Run 里创建的唯一关窗路径（CAS 幂等），
+	// 供窗口外的触发源调用 —— 目前只有托盘「退出」。
+	// atomic.Value 存 func(string)；Run 启动时装填。
+	closeFn atomic.Value
 	// frames 是观看端画面；preview 是分享端本地回显。两者都是"最新帧覆盖式"。
 	frames  chan *image.NRGBA
 	preview *image.NRGBA
@@ -368,6 +372,14 @@ func (s *Shell) Region() capture.Rect { return s.region }
 // SelectedDisplay 返回设置页选中的显示器。
 func (s *Shell) SelectedDisplay() capture.Display { return s.selDisplay }
 
+// RequestClose 请求关闭窗口（走与 ExitAfter 相同的唯一关窗路径，CAS 幂等）。
+// Run 尚未启动时调用无效（还没有可关的窗口）。
+func (s *Shell) RequestClose(reason string) {
+	if fn, ok := s.closeFn.Load().(func(string)); ok && fn != nil {
+		fn(reason)
+	}
+}
+
 // Run 运行窗口事件循环，阻塞到窗口关闭。
 func (s *Shell) Run(ctx context.Context) error {
 	w := new(app.Window)
@@ -401,6 +413,7 @@ func (s *Shell) Run(ctx context.Context) error {
 		}()
 		w.Perform(system.ActionClose)
 	}
+	s.closeFn.Store(closeNow)
 	if s.cfg.ExitAfter > 0 {
 		// ⚠️ 定时器**必须独立于渲染帧**。
 		//

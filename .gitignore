@@ -30,3 +30,8 @@ uicheck-mutate.txt
 
 # 本地环境配置
 .env
+
+# 发布构建产物（winres 生成物 / 分发包）
+rsrc_*.syso
+cmd/**/rsrc_*.syso
+/dist/

@@ -6,6 +6,7 @@ require (
 	gioui.org v0.10.2
 	github.com/go-mswin/screencapture v0.2.0
 	github.com/pion/webrtc/v4 v4.2.20
+	golang.org/x/image v0.26.0
 	golang.org/x/sys v0.41.0
 )
 
@@ -32,7 +33,6 @@ require (
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/exp/shiny v0.0.0-20250408133849-7e4ce0ab07d0 // indirect
-	golang.org/x/image v0.26.0 // indirect
 	golang.org/x/net v0.50.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 	golang.org/x/time v0.14.0 // indirect

@@ -25,8 +25,13 @@ import (
 	"goshare/internal/pipeline"
 	"goshare/internal/rtc"
 	"goshare/internal/signal"
+	"goshare/internal/tray"
 	"goshare/internal/ui"
 )
+
+// version 由发布构建用 -ldflags "-X main.version=x.y.z" 注入；
+// 开发态（go build / go run）保持 "dev"。
+var version = "dev"
 
 // UDP 端口区间：固定后防火墙放行规则可以写成一条固定命令（见启动时打印的指引）。
 const (
@@ -75,6 +80,8 @@ func main() {
 	ctx := context.Background()
 	ds, err := capture.Displays(ctx)
 	if err != nil || len(ds) == 0 {
+		// windowsgui 构建下 stderr 不可见，必须弹窗让用户看到失败原因。
+		ui.AlertError("GoShare 启动失败", fmt.Sprintf("枚举显示器失败：%v", err))
 		fmt.Fprintf(os.Stderr, "枚举显示器失败: %v\n", err)
 		os.Exit(1)
 	}
@@ -94,8 +101,13 @@ func main() {
 		switchAt: *switchAt, switchRegion: *switchRegion,
 		switchDisp: *switchDisp, displays: ds,
 	}
+	title := "GoShare · 内网桌面共享"
+	if version != "dev" {
+		title += " v" + version
+	}
+	a.title = title
 	a.shell = ui.NewShell(ui.ShellConfig{
-		Title:    "GoShare · 内网桌面共享",
+		Title:    title,
 		Displays: ds,
 		Presets:  names,
 		ExitAfter: *exitAfter,
@@ -112,6 +124,35 @@ func main() {
 		OnScan:       a.scan,
 		OnLeaveView:  a.leaveView,
 	})
+
+	// 托盘常驻（P0 #1 收尾）：只进交互模式。分享开始主窗最小化后，
+	// 用户通过托盘恢复窗口 / 停止分享 / 退出。
+	// -auto 自动化路径**不启用**：托盘要弹菜单、抢前台，会污染 e2e 时序。
+	if *auto == "" {
+		t, terr := tray.New(tray.Config{
+			Tooltip: title,
+			OnShow: func() {
+				if err := ui.RestoreMainWindow(); err != nil {
+					log.Printf("托盘：恢复主窗失败: %v", err)
+				}
+			},
+			OnStop: func() {
+				a.stopShare()
+				// 停完把窗口带回前台，让用户看到停下来的状态。
+				if err := ui.RestoreMainWindow(); err != nil {
+					log.Printf("托盘：恢复主窗失败: %v", err)
+				}
+			},
+			OnQuit: func() { a.shell.RequestClose("托盘退出") },
+		})
+		if terr != nil {
+			// 托盘失败不致命：主窗还在任务栏，功能不受影响。
+			log.Printf("托盘创建失败（主窗口仍可正常使用）: %v", terr)
+		} else {
+			a.tray = t
+			defer t.Close()
+		}
+	}
 
 	// 无人值守验证入口：跳过界面点击，直接进入对应流程。
 	switch *auto {
@@ -151,6 +192,8 @@ func main() {
 type app struct {
 	ctx        context.Context
 	shell      *ui.Shell
+	tray       *tray.Tray // 仅交互模式非 nil
+	title      string     // 窗口标题（含版本），托盘气泡复用
 	port       int
 	maxViewers int
 	fixedCode  string
@@ -493,6 +536,11 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 	log.Printf("分享已开始：端口 %d 授权码 %s 地址 %v", srv.Port(), srv.Code(), srv.ShareAddrs())
 	printFirewallHint(srv.Port())
 	a.pushShareState()
+	if a.tray != nil {
+		a.tray.SetSharing(true, a.title+" · 正在分享")
+		a.tray.Balloon("GoShare 正在分享",
+			fmt.Sprintf("端口 %d · 授权码 %s。双击托盘图标恢复窗口。", srv.Port(), srv.Code()))
+	}
 
 	// P0-1 防自摄入：自己的窗口会被自己采集成无限套娃（实测套了 6~7 层），
 	// 每帧都在变 → 全量帧永不停止 → 带宽白烧。分享一开始就把主窗最小化。
@@ -508,7 +556,7 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 		for i := 0; i < 20; i++ {
 			time.Sleep(150 * time.Millisecond)
 			if err := ui.MinimizeMainWindow(); err == nil {
-				log.Printf("防自摄入：主窗已最小化（从任务栏点图标可恢复查看状态）")
+				log.Printf("防自摄入：主窗已最小化（双击托盘图标可恢复查看状态）")
 				return
 			}
 		}
@@ -661,6 +709,9 @@ func (a *app) stopShare() {
 		cancel()
 	}
 	a.shell.SetShareState(ui.ShareState{})
+	if a.tray != nil {
+		a.tray.SetSharing(false, "GoShare · 内网桌面共享")
+	}
 	if hadSession {
 		log.Printf("分享已停止")
 	}
