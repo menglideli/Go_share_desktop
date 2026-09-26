@@ -124,6 +124,25 @@ type Stats struct {
 	capture.Stats
 }
 
+// wireFrame 是一帧已序列化的线格式数据（扇出共享缓存）。
+//
+// 架构（"写缓存 / 读缓存"）：Run 循环每帧只 encode + Marshal 一次，把结果
+// 放进 latest；每个观众有独立的发送 goroutine，被唤醒后读 latest 里**最新**
+// 那份自己分片发送。慢观众自然跳过中间帧（永远拿最新的），快观众一帧不落，
+// 谁都不占采集/编码 goroutine 的时间 —— 旧实现把"每观众一次 Marshal +
+// 分片"全串在采集循环里，4 人时全员 fps 从 28+ 腰斩到 15（实测 e2e63）。
+type wireFrame struct {
+	seq  uint64
+	data []byte
+}
+
+// peerSlot 是一个观众的扇出状态。
+type peerSlot struct {
+	wake chan struct{}  // cap 1：新帧到达信号（多次发布会聚合，读时总是取最新）
+	done chan struct{}  // 关闭即让发送 goroutine 退出
+	once sync.Once      // done 只关一次
+}
+
 // Sharer 是一条分享管线：单采集、单编码、扇出给多个观众。
 type Sharer struct {
 	cfg Config
@@ -134,8 +153,10 @@ type Sharer struct {
 	enc *codec.Encoder
 
 	mu    sync.Mutex
-	peers map[*rtc.Peer]struct{}
+	peers map[*rtc.Peer]*peerSlot
 	stats Stats
+	// latest 是扇出共享缓存：最近一帧的线格式数据（见 wireFrame 注释）。
+	latest atomic.Pointer[wireFrame]
 	// wantKey 表示下一位观众（或全部观众）需要全量帧
 	wantKey bool
 	// paused 为 true 时不再发送真实画面，改发纯黑帧（见 SetPaused）。
@@ -174,7 +195,7 @@ func NewSharer(ctx context.Context, cfg Config) (*Sharer, error) {
 	sh := &Sharer{
 		cfg:       cfg,
 		enc:       codec.NewEncoder(codec.Config{Quality: cfg.Preset.Quality, Tiles: cfg.Preset.Tiles, Dirty: cfg.Preset.Dirty}),
-		peers:     map[*rtc.Peer]struct{}{},
+		peers:     map[*rtc.Peer]*peerSlot{},
 		lastKeyAt: time.Now(),
 	}
 	sh.src.Store(src)
@@ -226,8 +247,13 @@ func (s *Sharer) SetDisplay(ctx context.Context, d capture.Display, r capture.Re
 
 // AddPeer 加入一个观众。新观众会触发一次全量帧，保证秒开。
 func (s *Sharer) AddPeer(p *rtc.Peer) {
+	slot := &peerSlot{wake: make(chan struct{}, 1), done: make(chan struct{})}
 	s.mu.Lock()
-	s.peers[p] = struct{}{}
+	// 同一 Peer 重复 Add（理论上不该发生）时先停掉旧 goroutine，避免泄漏。
+	if old, ok := s.peers[p]; ok {
+		old.once.Do(func() { close(old.done) })
+	}
+	s.peers[p] = slot
 	s.wantKey = true
 	// 开启补帧窗口：新观众要的是"尽快看到完整画面"，而不是"恰好发过一次
 	// 全量帧"（那一次很可能撞在通道未就绪上，见 R32）。
@@ -236,13 +262,47 @@ func (s *Sharer) AddPeer(p *rtc.Peer) {
 	}
 	s.mu.Unlock()
 	s.enc.ForceKeyFrame()
+	go s.sendLoop(p, slot)
 }
 
 // RemovePeer 移除观众。
 func (s *Sharer) RemovePeer(p *rtc.Peer) {
 	s.mu.Lock()
+	slot, ok := s.peers[p]
 	delete(s.peers, p)
 	s.mu.Unlock()
+	if ok {
+		slot.once.Do(func() { close(slot.done) })
+	}
+}
+
+// sendLoop 是单个观众的发送 goroutine：被唤醒后读共享缓存里**最新**一帧
+// 分片发送。慢观众被背压时直接跳过整帧（下一唤醒拿到的还是最新的），
+// 不拖慢采集循环，也不影响其他观众。
+func (s *Sharer) sendLoop(p *rtc.Peer, slot *peerSlot) {
+	var lastSent uint64
+	for {
+		select {
+		case <-slot.done:
+			return
+		case <-slot.wake:
+		}
+		wf := s.latest.Load()
+		if wf == nil || wf.seq <= lastSent {
+			continue
+		}
+		// 背压在 SendWire 内部处理（弱网观众自己丢帧）。
+		if err := p.SendWire(wf.seq, wf.data); err == nil {
+			lastSent = wf.seq
+			s.mu.Lock()
+			s.stats.SentBytes += uint64(len(wf.data))
+			s.stats.SentFrames++
+			s.mu.Unlock()
+		} else if errors.Is(err, rtc.ErrNotOpen) {
+			// 通道还没建好（握手中）：不算发送成功，但 seq 也别推进，
+			// 等下一帧再试 —— 补帧窗口（KeyBurst）保证开局完整性。
+		}
+	}
 }
 
 // PeerCount 返回当前观众数。
@@ -495,31 +555,32 @@ func (s *Sharer) emit(f capture.Frame) error {
 		s.lastKeyAt = time.Now()
 		s.stats.Keys++
 	}
-	peers := make([]*rtc.Peer, 0, len(s.peers))
-	for p := range s.peers {
-		peers = append(peers, p)
+	slots := make([]*peerSlot, 0, len(s.peers))
+	for _, slot := range s.peers {
+		slots = append(slots, slot)
 	}
 	s.mu.Unlock()
 
 	if s.cfg.OnFrame != nil {
 		s.cfg.OnFrame(out, f)
 	}
-	// 只有真正发出去（通道已开且没被背压丢掉）的才算出网。
-	// 统计它而不是"编码字节 × 人数"，是因为弱网观众会被背压丢帧，
-	// 乘出来的数字会高估（背压越重差得越多）。
-	var sentBytes, sentFrames uint64
-	for _, p := range peers {
-		// 背压在 Peer 内部处理：弱网观众自己丢帧，不影响其他人
-		if err := p.SendFrame(out); err == nil {
-			sentBytes += uint64(out.Bytes)
-			sentFrames++
-		}
+	if len(slots) == 0 {
+		return nil
 	}
-	if sentFrames > 0 {
-		s.mu.Lock()
-		s.stats.SentBytes += sentBytes
-		s.stats.SentFrames += sentFrames
-		s.mu.Unlock()
+	// 写共享缓存：线格式只序列化一次（旧实现每个观众各 Marshal 一遍，
+	// 2K 全量 ≈2MB/次的拷贝全串在采集 goroutine 上，4 人时全员 fps 腰斩）。
+	data, err := out.Marshal()
+	if err != nil {
+		return err
+	}
+	s.latest.Store(&wireFrame{seq: out.Seq, data: data})
+	// 广播唤醒（非阻塞：慢观众的 wake 里已有信号就说明它还没读，
+	// 反正它读的时候拿的是 latest 里最新的，不丢"最新性"）。
+	for _, slot := range slots {
+		select {
+		case slot.wake <- struct{}{}:
+		default:
+		}
 	}
 	return nil
 }

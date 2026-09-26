@@ -309,6 +309,63 @@ func main() {
 		}
 	}
 
+	// ---------- 6. 饱和色卡保真（通道级缺陷门禁） ----------
+	// PSNR 是亮度统计，抓不到"只有极端饱和像素才触发"的通道缺陷 ——
+	// 真实案例：色度公式未钳位，纯红 Cr=256 回绕成 0，红色塌成暗绿，
+	// 而既有 14 项检查全绿。桌面 UI 里近纯红/纯蓝到处都是，必须单独断言。
+	out("")
+	out("[6] 饱和色卡保真（8 色，逐通道断言）")
+	{
+		type swatch struct {
+			name    string
+			r, g, b uint8
+		}
+		swatches := []swatch{
+			{"纯红", 255, 0, 0}, {"纯绿", 0, 255, 0}, {"纯蓝", 0, 0, 255},
+			{"纯黄", 255, 255, 0}, {"纯青", 0, 255, 255}, {"品红", 255, 0, 255},
+			{"深红", 200, 16, 16}, {"纯白", 255, 255, 255},
+		}
+		const sw, sh = 512, 64
+		src := make([]byte, sw*sh*4)
+		for i := 0; i < sw*sh; i++ {
+			s := swatches[(i%sw)/64]
+			p := i * 4
+			src[p], src[p+1], src[p+2], src[p+3] = s.b, s.g, s.r, 255
+		}
+		enc := codec.NewEncoder(codec.Config{Quality: 95, Tiles: 1, Dirty: false})
+		f, err := enc.Encode(src, sw, sh)
+		if err != nil {
+			check("色卡编码", false, err.Error())
+		} else {
+			// 过一遍线格式，模拟真实链路
+			wire, _ := f.Marshal()
+			f2, _ := codec.UnmarshalFrame(wire)
+			dec := codec.NewDecoder(0)
+			img, err := dec.Decode(f2)
+			if err != nil {
+				check("色卡解码", false, err.Error())
+			} else {
+				worst := ""
+				bad := 0
+				for k, s := range swatches {
+					p := ((32*sw + k*64 + 32) * 4)
+					dr := int(img.Pix[p]) - int(s.r)
+					dg := int(img.Pix[p+1]) - int(s.g)
+					db := int(img.Pix[p+2]) - int(s.b)
+					for _, d := range []int{dr, dg, db} {
+						if d < -24 || d > 24 { // JPEG q95 允许小误差；通道对调/回绕差 ≥88 必超阈
+							bad++
+							worst = fmt.Sprintf("%s 期望(%d,%d,%d) 实际(%d,%d,%d)",
+								s.name, s.r, s.g, s.b, img.Pix[p], img.Pix[p+1], img.Pix[p+2])
+						}
+					}
+				}
+				check("8 色逐通道保真", bad == 0,
+					fmt.Sprintf("超阈通道 %d 个 %s", bad, worst))
+			}
+		}
+	}
+
 	out("")
 	out("------------------------------------------------------------")
 	out(fmt.Sprintf("结果: %d 通过 / %d 失败", pass, fail))

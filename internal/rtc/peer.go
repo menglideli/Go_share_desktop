@@ -239,6 +239,21 @@ func (p *Peer) WaitReady(timeout time.Duration) error {
 
 // SendFrame 编码并发送一帧。buf 会被切成 ≤60KB 的分片。
 func (p *Peer) SendFrame(f *codec.Frame) error {
+	data, err := f.Marshal()
+	if err != nil {
+		return err
+	}
+	return p.SendWire(f.Seq, data)
+}
+
+// SendWire 发送一段**已序列化**的线格式帧（切成 ≤60KB 分片）。
+//
+// 为什么从 SendFrame 里拆出来：多观众扇出时 Marshal 是一帧里最大的拷贝
+// （2K 全量约 2MB），旧实现每个观众各 Marshal 一次，全部串在采集 goroutine
+// 上 —— 4 人时全员 fps 腰斩到 15。拆开后管线只 Marshal 一次放进共享缓存，
+// 每个观众的发送 goroutine 各拿同一份线格式数据自己分片发送（见
+// pipeline.Sharer 的"写缓存 / 读缓存"扇出）。
+func (p *Peer) SendWire(seq uint64, data []byte) error {
 	p.mu.Lock()
 	m := p.media
 	p.mu.Unlock()
@@ -255,15 +270,11 @@ func (p *Peer) SendFrame(f *codec.Frame) error {
 		p.mu.Unlock()
 		return ErrBackpressure
 	}
-	data, err := f.Marshal()
-	if err != nil {
-		return err
-	}
 	total := (len(data) + chunkPayload - 1) / chunkPayload
 	if total > 65535 {
 		return errors.New("rtc: 帧过大，超出分片上限")
 	}
-	seq := uint32(f.Seq)
+	s32 := uint32(seq)
 	sent := 0
 	for i := 0; i < total; i++ {
 		lo := i * chunkPayload
@@ -272,7 +283,7 @@ func (p *Peer) SendFrame(f *codec.Frame) error {
 			hi = len(data)
 		}
 		msg := make([]byte, chunkHeaderLen+hi-lo)
-		binary.BigEndian.PutUint32(msg[0:4], seq)
+		binary.BigEndian.PutUint32(msg[0:4], s32)
 		binary.BigEndian.PutUint16(msg[4:6], uint16(i))
 		binary.BigEndian.PutUint16(msg[6:8], uint16(total))
 		copy(msg[chunkHeaderLen:], data[lo:hi])
