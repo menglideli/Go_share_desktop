@@ -107,6 +107,25 @@ func main() {
 				ok = false
 			}
 			detail += fmt.Sprintf(" · 停止按钮 %v（%d px）完整可见=%v", btn, n, fits)
+
+			// 按钮里的字必须在按钮内**垂直居中**：Gio 的 Button 用 layout.Center
+			// 居中的是行盒，而中文字形墨迹在行盒里不居中（微软雅黑 ascent/descent
+			// 不对称），实测会低 2~3px —— 用户报的"停止二字位置不对"就是它。
+			// 修法是给按钮上小下大的内边距补偿（见 internal/ui/hud.go）。
+			lbl, ln := lightBoundsIn(img, btn)
+			labelOff := 99
+			if ln > 0 && !btn.Empty() {
+				labelOff = (lbl.Min.Y+lbl.Max.Y)/2 - (btn.Min.Y+btn.Max.Y)/2
+				if labelOff < 0 {
+					labelOff = -labelOff
+				}
+			}
+			centered := ln > 0 && labelOff <= 1
+			if !centered {
+				ok = false
+			}
+			detail += fmt.Sprintf(" · 「停止」二字 %v（%d px）垂直偏差 %dpx 居中=%v",
+				lbl, ln, labelOff, centered)
 		}
 
 		// 判据二（R31）：与基线图逐像素比对。
@@ -228,7 +247,7 @@ type testCase struct {
 
 func cases() []testCase {
 	// 假状态：只为把版面填满，验证"该画的地方都画出来了"
-	fakeAddrs := []string{"192.168.250.180:9000", "192.168.11.248:9000", "172.17.51.33:9000"}
+	fakeAddrs := []string{"192.0.2.180:9000", "192.0.2.248:9000", "203.0.113.33:9000"}
 	now := time.Now()
 
 	return []testCase{
@@ -239,8 +258,8 @@ func cases() []testCase {
 				Active: true, Code: "482913", Addrs: fakeAddrs, Port: 9000,
 				PresetName: "最大", Paused: false,
 				Viewers: []ui.ViewerRow{
-					{Name: "GKYN20230046", IP: "192.168.250.180", Since: now.Add(-75 * time.Second)},
-					{Name: "DESKTOP-7K2", IP: "192.168.250.191", Since: now.Add(-12 * time.Second)},
+					{Name: "DESKTOP-EXAMPLE", IP: "192.0.2.180", Since: now.Add(-75 * time.Second)},
+					{Name: "DESKTOP-7K2", IP: "192.0.2.191", Since: now.Add(-12 * time.Second)},
 				},
 				HUD:        "发送 29.8 fps · 7.4 Mbps\n编码 9.9 ms · 采集 duplication\n已发 1842 帧 · 观众 2 人\n共享 整屏",
 				RegionText: "整屏",
@@ -252,7 +271,7 @@ func cases() []testCase {
 			s.SetShareState(ui.ShareState{
 				Active: true, Code: "482913", Addrs: fakeAddrs, Port: 9000,
 				PresetName: "流畅30", Paused: true,
-				Viewers:    []ui.ViewerRow{{Name: "GKYN20230046", IP: "192.168.250.180", Since: now.Add(-40 * time.Second)}},
+				Viewers:    []ui.ViewerRow{{Name: "DESKTOP-EXAMPLE", IP: "192.0.2.180", Since: now.Add(-40 * time.Second)}},
 				HUD:        "发送 0.8 fps · 0.1 Mbps\n编码 6.2 ms · 采集 duplication\n已发 1901 帧 · 观众 1 人\n共享 区域 1280×720",
 				RegionText: "区域 1280×720",
 			})
@@ -262,8 +281,8 @@ func cases() []testCase {
 			s.SetJoinState(ui.JoinState{
 				Status: "发现 2 个分享，点击填入地址",
 				Found: []ui.FoundRow{
-					{Name: "GKYN20230046", Addr: "192.168.250.180:9000"},
-					{Name: "DESKTOP-7K2", Addr: "192.168.250.191:9000"},
+					{Name: "DESKTOP-EXAMPLE", Addr: "192.0.2.180:9000"},
+					{Name: "DESKTOP-7K2", Addr: "192.0.2.191:9000"},
 				},
 			})
 		}},
@@ -273,11 +292,11 @@ func cases() []testCase {
 			})
 		}},
 		{name: "viewing", setup: func(s *ui.Shell) {
-			s.SetJoinState(ui.JoinState{Status: "GKYN20230046 · 29.4 fps · 7.1 Mbps · 解码 4.9 ms"})
+			s.SetJoinState(ui.JoinState{Status: "DESKTOP-EXAMPLE · 29.4 fps · 7.1 Mbps · 解码 4.9 ms"})
 			s.SetLastFrame(synth(960, 540))
 		}},
 		{name: "viewing-zoom", setup: func(s *ui.Shell) {
-			s.SetJoinState(ui.JoinState{Status: "GKYN20230046 · 29.4 fps · 7.1 Mbps · 解码 4.9 ms"})
+			s.SetJoinState(ui.JoinState{Status: "DESKTOP-EXAMPLE · 29.4 fps · 7.1 Mbps · 解码 4.9 ms"})
 			// 1:1 模式：画面比窗口大（只显示局部、可平移），原始像素不缩放
 			s.SetLastFrame(synth(1920, 1080))
 			s.SetZoom100(true)
@@ -293,22 +312,62 @@ func cases() []testCase {
 		// 同一根条在 175% 缩放下的样子：真实机器就是 175%，高 DPI 下的裁切
 		// 只有这一条能盯住（dp 布局相同、像素不同，出问题的方式也不同）。
 		{name: "hud-175", setup: nil},
+		// 长文本（暂停 + 12 人 + 自适应降档后缀）：条体是定宽 320dp，
+		// 文字一长就可能把「停止」按钮挤出去 —— 用户报的"按钮显示不正常"
+		// 最可能的形态就是这个，必须当门禁盯着。
+		{name: "hud-long", setup: nil},
 	}
 }
 
-// hudCases 是悬浮条的离屏渲染用例：用例名 → 缩放。
+// hudCases 是悬浮条的离屏渲染用例：用例名 → 缩放 + 显示内容。
 //
 // ⚠️ 尺寸必须与**真实窗口**一致：真实窗口是 app.Size(Dp(320), Dp(46))，
 // 175% 缩放下即 560×80 物理像素。旧基线按 340×56 渲染（两个数都对不上），
 // 等于"验过的"和"用户看到的"不是同一个东西。
-var hudCases = map[string]struct{ scale float32 }{
-	"hud":     {scale: 1},
-	"hud-175": {scale: 1.75},
+//
+// 内容也要覆盖真实会出现的**长文本**（暂停 + 多人 + 自适应降档后缀）：
+// 条体是定宽 320dp，文字一长就可能把「停止」按钮挤出条体 ——
+// 那正是"停止按钮显示不正常"的典型成因，必须当门禁用例盯着。
+var hudCases = map[string]hudCase{
+	"hud":      {scale: 1, viewers: 3, quality: "最大·q59"},
+	"hud-175":  {scale: 1.75, viewers: 3, quality: "最大·q59"},
+	"hud-long": {scale: 1.75, viewers: 12, quality: "流畅30·q59", paused: true},
+}
+
+// hudCase 是一条悬浮条渲染用例。
+type hudCase struct {
+	scale   float32
+	viewers int
+	quality string
+	paused  bool
 }
 
 // hudPixelSize 返回悬浮条在给定缩放下的物理像素尺寸（320×46 dp）。
 func hudPixelSize(scale float32) image.Point {
 	return image.Pt(int(320*scale+0.5), int(46*scale+0.5))
+}
+
+// lightBoundsIn 返回区域内亮像素（文字）的包围盒与像素数。
+// 用来量"按钮里的字有没有在按钮内居中"。
+func lightBoundsIn(img *image.RGBA, r image.Rectangle) (image.Rectangle, int) {
+	r = r.Intersect(img.Bounds())
+	var box image.Rectangle
+	n := 0
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		for x := r.Min.X; x < r.Max.X; x++ {
+			i := y*img.Stride + x*4
+			if int(img.Pix[i]) > 180 && int(img.Pix[i+1]) > 180 && int(img.Pix[i+2]) > 180 {
+				p := image.Rect(x, y, x+1, y+1)
+				if n == 0 {
+					box = p
+				} else {
+					box = box.Union(p)
+				}
+				n++
+			}
+		}
+	}
+	return box, n
 }
 
 // redBounds 找「停止」按钮的纯红区块（colBad = 224,82,82，不透明），
@@ -354,7 +413,7 @@ func render(win *headless.Window, th *material.Theme, w, h int, name string, set
 	if hc, ok := hudCases[name]; ok {
 		gtx.Metric = unit.Metric{PxPerDp: hc.scale, PxPerSp: hc.scale}
 		bar := ui.NewHUD(ui.HUDConfig{Title: "uicheck-hud"})
-		bar.SetState(3, "最大·q59", false)
+		bar.SetState(hc.viewers, hc.quality, hc.paused)
 		layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			gtx.Constraints = layout.Exact(hudPixelSize(hc.scale))
 			return bar.Layout(gtx, th)

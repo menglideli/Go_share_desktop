@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/bits"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -121,7 +122,7 @@ type Stats struct {
 	Bytes     uint64
 	DropIdle  uint64 // 因帧率限制跳过的帧
 	Heartbeat uint64
-	Keys      uint64 // 全量帧数（含接入/切换档位/周期兜底）
+	Keys      uint64  // 全量帧数（含接入/切换档位/周期兜底）
 	EncodeMs  float64 // 均值
 	// SentBytes / SentFrames 是**真正发给观众的**字节与人次帧数。
 	//
@@ -153,9 +154,9 @@ type wireFrame struct {
 
 // peerSlot 是一个观众的扇出状态。
 type peerSlot struct {
-	wake chan struct{}  // cap 1：新帧到达信号（多次发布会聚合，读时总是取最新）
-	done chan struct{}  // 关闭即让发送 goroutine 退出
-	once sync.Once      // done 只关一次
+	wake chan struct{} // cap 1：新帧到达信号（多次发布会聚合，读时总是取最新）
+	done chan struct{} // 关闭即让发送 goroutine 退出
+	once sync.Once     // done 只关一次
 }
 
 // Sharer 是一条分享管线：单采集、单编码、扇出给多个观众。
@@ -203,15 +204,18 @@ type Sharer struct {
 	// lastRepair 是上一次开启渐进式修复轮次的时刻（持 adaptMu 访问）。
 	// 冷却见 repairCooldown。
 	lastRepair time.Time
+	// missingTiles 是观众端"点名"要补的条带位图（多观众 OR 在一起）。
+	// Run/emit 每帧取走一次（见 codec.Encoder.RequestTiles）。
+	missingTiles atomic.Uint64
 	// adapt 是自适应质量控制器状态（持 adaptMu 访问）。
 	adapt adaptCtrl
 }
 
 // adaptCtrl 是自适应质量控制器的内部状态（见 Config.AdaptiveOff）。
 type adaptCtrl struct {
-	level      int       // 当前档（0 = 用户设定档位，越大越省带宽）
-	maxLevel   int       // 由基准档位算出：质量阶梯级数 + 帧率阶梯级数
-	cleanTicks int       // 连续无背压的秒数（回升依据）
+	level      int // 当前档（0 = 用户设定档位，越大越省带宽）
+	maxLevel   int // 由基准档位算出：质量阶梯级数 + 帧率阶梯级数
+	cleanTicks int // 连续无背压的秒数（回升依据）
 	// lastDown 是上次**降档**时刻（降档冷却用）。回升不更新它：
 	// 刚升上去就遇到背压说明升错了，要能立刻降回来，不受冷却挡。
 	lastDown time.Time
@@ -551,6 +555,32 @@ const repairCooldown = 800 * time.Millisecond
 // 10 帧 @30fps ≈ 0.33 秒铺满整屏，期间每帧多带 1/10 的条带 —— 单帧依旧很小。
 const defaultRepairOverFrames = 10
 
+// RequestTiles 请观众端"点名"的条带在下一帧补上（精确补发）。
+//
+// 与 RequestRepair 的分工：
+//   - RequestTiles：观众报上来缺哪几条，就只补那几条 —— 一帧补齐、几十 KB；
+//   - RequestRepair：不知道缺什么/缺一大片时，轮转把整屏铺一遍（十几帧）。
+//
+// 多个观众的请求会 OR 到一起（编码只做一次、扇出给所有人，
+// 所以补发是"全局"的： someone 缺的条带，其他人会多收一份，代价可忽略）。
+func (s *Sharer) RequestTiles(mask uint64) {
+	if mask == 0 {
+		return
+	}
+	// 全都要 = 等价于"整屏重来"，走轮转修复（摊到十几帧），
+	// 别一发 2MB 突发把刚堵住的通道再堵一次。
+	if n := s.enc.TileCount(); n > 0 && bits.OnesCount64(mask) >= n {
+		s.RequestRepair()
+		return
+	}
+	for {
+		old := s.missingTiles.Load()
+		if s.missingTiles.CompareAndSwap(old, old|mask) {
+			return
+		}
+	}
+}
+
 // RequestRepair 请求一轮**渐进式修复**：把补齐整屏分摊到后续约 10 帧里，
 // 而不是发一发 2MB 的全量帧突发（拥塞时那一发大概率整发丢掉）。
 //
@@ -790,6 +820,11 @@ func (s *Sharer) emit(f capture.Frame) error {
 	if s.mu.TryLock() {
 		s.wantKey = false
 		s.mu.Unlock()
+	}
+	// 观众端点名要补的条带（精确补发）：取走一次即清空，
+	// 编码器会在这一帧里额外带上它们（见 codec.Encoder.RequestTiles）。
+	if m := s.missingTiles.Swap(0); m != 0 {
+		enc.RequestTiles(m)
 	}
 	// 修复策略（R32/R39）——分两层，代价与收益分开算：
 	//

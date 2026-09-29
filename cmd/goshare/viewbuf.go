@@ -14,12 +14,13 @@ package main
 
 import (
 	"image"
+	"log"
 
 	"goshare/internal/codec"
 )
 
-// dispBufN 是池子大小：一块在界面上、一块在解码侧就够轮转。
-const dispBufN = 2
+// dispBufN 是池子大小：一块在界面上、一块在解码侧就够轮转，多留一块作缓冲余量。
+const dispBufN = 3
 
 // dispBuf 是一块可复用的画面缓冲。
 type dispBuf struct {
@@ -39,17 +40,26 @@ type dispPool struct {
 	tileH int
 	nTile int
 	back  chan *image.NRGBA
+	// missStreak 是"连续拿不到可用缓冲"的次数（见 Take 的兜底）。
+	missStreak int
 }
 
 func newDispPool() *dispPool {
+	// ⚠️ back 只在这里创建**一次**，Reset 绝不重建它。
+	// 界面（ui.Shell）在启动时就通过 ShellConfig.Recycle 抓住了这个通道，
+	// 换掉它等于让界面把缓冲还进一个没人读的通道 —— 池子再也收不回缓冲，
+	// 两块用尽后画面就**永久停住**（实测：先冻在"只有上半屏"的初始快照上，
+	// 因为那块快照是全量同步时做的，而当时画布只填了几条带）。
+	// 这是个极隐蔽的坑：不改通道的内容，只改它的身份。
 	return &dispPool{back: make(chan *image.NRGBA, dispBufN)}
 }
 
-// Reset 在分辨率（或条带切分）变化时重建池子 —— 旧尺寸的缓冲全部淘汰。
+// Reset 在分辨率（或条带切分）变化时重建缓冲集合 —— 旧尺寸的缓冲全部淘汰。
+// 归还在途的旧缓冲会被 collect 忽略（不在 bufs 里），交给 GC。
 func (p *dispPool) Reset(w, h, tileH, nTiles int) {
 	p.w, p.h, p.tileH, p.nTile = w, h, tileH, nTiles
 	p.bufs = nil
-	p.back = make(chan *image.NRGBA, dispBufN)
+	p.missStreak = 0
 }
 
 // Recycle 返回交给界面归还用的通道。
@@ -58,6 +68,21 @@ func (p *dispPool) Recycle() chan *image.NRGBA { return p.back }
 // W / H 返回当前缓冲尺寸（0 表示尚未建立）。
 func (p *dispPool) W() int { return p.w }
 func (p *dispPool) H() int { return p.h }
+
+// Stats 返回池子状态：空闲块数 / 被界面持有块数 / 累计兜底次数。
+//
+// 必须有这个观测：池子用尽的表现是"走整帧拷贝兜底"（慢但不冻屏），
+// 没有计数就分不清"池子健康"与"一直在兜底"。
+func (p *dispPool) Stats() (free, held, fallback int) {
+	for _, b := range p.bufs {
+		if b.held {
+			held++
+		} else {
+			free++
+		}
+	}
+	return free, held, p.missStreak
+}
 
 // MarkDirty 记录"这些条带的内容变了"。
 //
@@ -89,11 +114,14 @@ func (p *dispPool) collect() {
 	}
 }
 
-// Take 取一块**已经与解码画布同步**的缓冲交给界面；没有可用缓冲时返回 nil
-// （宁可这一帧不上屏 —— 界面显示的还是上一帧的完整画面，不闪不裂）。
+// Take 取一块**已经与解码画布同步**的缓冲交给界面。
+//
+// ⚠️ 池子用尽时**绝不能停帧**：停帧的表现是"画面冻住、只有一半"（用户会以为断线）。
+// 这里降级成"每 6 帧一次整帧拷贝"（一次性缓冲，不进池子），保证画面始终在动。
+// 会打日志 —— 池子用尽是异常状态（正常只有 1 块在界面上），不能静默。
 func (p *dispPool) Take(src *codec.Decoder) *image.NRGBA {
 	canvas := src.Image()
-	if canvas == nil || p.w <= 0 {
+	if canvas == nil || p.w <= 0 || p.tileH <= 0 {
 		return nil
 	}
 	if canvas.Bounds().Dx() != p.w || canvas.Bounds().Dy() != p.h {
@@ -102,8 +130,20 @@ func (p *dispPool) Take(src *codec.Decoder) *image.NRGBA {
 	p.collect()
 	b := p.pick()
 	if b == nil {
-		return nil
+		p.missStreak++
+		// 每 6 帧补一次（30fps 下至少 5fps 的更新），避免退化成每帧一次 20MB 分配。
+		if p.missStreak%6 != 1 {
+			return nil
+		}
+		if p.missStreak == 1 || p.missStreak%300 == 0 {
+			log.Printf("viewer: 画面缓冲池用尽（连续 %d 次拿不到可用缓冲）—— 走整帧拷贝兜底；"+
+				"这通常意味着界面没有归还缓冲，画面会明显变卡", p.missStreak)
+		}
+		img := image.NewNRGBA(image.Rect(0, 0, p.w, p.h))
+		copy(img.Pix, canvas.Pix)
+		return img
 	}
+	p.missStreak = 0
 	mask := b.dirty
 	if b.fresh {
 		mask = allTiles(p.nTile)

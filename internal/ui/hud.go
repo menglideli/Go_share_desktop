@@ -289,11 +289,16 @@ func (h *HUD) Layout(gtx layout.Context, th *material.Theme) layout.Dimensions {
 		// 上层：内容行
 		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
 			return layout.UniformInset(unit.Dp(10)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				// ⚠️ 必须把 Min 撑到 Max：layout.Stack 会把子项的 Min 约束清零，
+				// ⚠️ 必须把**主轴**（横向）Min 撑到 Max：layout.Stack 会把子项的 Min 约束清零，
 				// 而 Flex 分配 SpaceBetween 的富余空间用的是 mainMin（= Min 约束），
 				// Min=0 时富余恒为 0 —— 表现就是「停止」按钮紧跟在文字后面、
 				// 条体右侧留下一大片空白（默认 SpaceBetween 形同失效）。
-				gtx.Constraints.Min = gtx.Constraints.Max
+				//
+				// ⚠️ 但**交叉轴（纵向）不能一起撑**：撑了之后 Flex 的子项会拿到
+				// min=max=满高 的约束，文字控件就按满高排版并从**顶部**开始画 ——
+				// 实测状态文字的垂直中心比条体中心高 4~5px（175% 下高 5px），
+				// 看着就是"没对齐"。只撑横向：子项保持自然高度，Middle 才生效。
+				gtx.Constraints.Min.X = gtx.Constraints.Max.X
 				return layout.Flex{Alignment: layout.Middle, Spacing: layout.SpaceBetween}.Layout(gtx,
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 						return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
@@ -314,7 +319,15 @@ func (h *HUD) Layout(gtx layout.Context, th *material.Theme) layout.Dimensions {
 						b := material.Button(th, &h.btnStop, "停止")
 						b.Background = colBad
 						b.Color = colText
-						b.Inset = layout.UniformInset(unit.Dp(6))
+						// ⚠️ 上下内边距故意不对称：Gio 的 Button 用 layout.Center 居中的是
+						// **行盒**，而中文字形的墨迹在行盒里并不居中（微软雅黑
+						// ascent/descent 不对称）。实测「停止」二字比按钮中心低 2px
+						// （175% 下低 3px），肉眼看得出来。上内边距 -2dp、下 +2dp
+						// 把墨迹推回中心，按钮总高不变（4+8 = 6+6）。
+						b.Inset = layout.Inset{
+							Top: unit.Dp(4), Right: unit.Dp(6),
+							Bottom: unit.Dp(8), Left: unit.Dp(6),
+						}
 						return b.Layout(gtx)
 					}),
 				)

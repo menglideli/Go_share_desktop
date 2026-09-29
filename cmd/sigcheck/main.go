@@ -77,7 +77,7 @@ func checkNetif() {
 		check("默认路由排在第一位", ok, fmt.Sprintf("默认=%v 首位=%v", def, ifs[0].IP))
 	}
 
-	// 虚拟网卡不该排在物理网卡前面：同事复制 VMware 的 192.168.246.1 是连不上的
+	// 虚拟网卡不该排在物理网卡前面：同事复制 VMware/虚拟网卡的地址（形如 192.168.x.1）是连不上的
 	firstVirtual := -1
 	lastPhysical := -1
 	for idx, i := range ifs {

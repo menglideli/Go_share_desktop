@@ -35,7 +35,10 @@ if ($LASTEXITCODE) { exit $LASTEXITCODE }
 Write-Host "== 3/4 Build single-file exe ==" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force dist | Out-Null
 $exe = "dist/goshare-v$Version-windows-amd64.exe"
-go build -ldflags "-H windowsgui -s -w -X main.version=$Version" -o $exe ./cmd/goshare
+# -trimpath is REQUIRED for anything you hand to other people: without it the
+# binary embeds absolute build paths, which leak the build machine's user
+# profile (e.g. C:\Users\<name>\go\pkg\mod\...) to anyone who runs `strings`.
+go build -trimpath -ldflags "-H windowsgui -s -w -X main.version=$Version" -o $exe ./cmd/goshare
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
 Write-Host "== 4/4 Verify ==" -ForegroundColor Cyan

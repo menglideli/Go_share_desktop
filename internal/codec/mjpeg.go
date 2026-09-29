@@ -124,6 +124,9 @@ type Encoder struct {
 	repairCur   int   // 轮转游标
 	repairEpoch uint8 // 当前轮次号（写进每帧的 Refresh 字段）
 	refresh     uint8 // 本帧要写出的轮次号（0 = 稳态）
+	// pendingTiles 是观众端"点名"要补的条带位图（见 RequestTiles）。
+	// 只在编码 goroutine 里读写。
+	pendingTiles uint64
 }
 
 // NewEncoder 创建编码器。初始尺寸未知，首次 Encode 时按帧尺寸初始化。
@@ -162,6 +165,22 @@ func (e *Encoder) BeginRepair(overFrames int) {
 
 // Repairing 报告当前是否有一轮修复在飞。
 func (e *Encoder) Repairing() bool { return e.repairLeft > 0 }
+
+// RequestTiles 要求下一帧**额外**带上这些条带（即使它们没有变化）。
+//
+// 与 BeginRepair 的区别：这是"精确点名"。观众端把自己画布上"内容已过期"的
+// 条带位图报上来，这里只补那几条 —— 通常一帧内补完、几十 KB；
+// 而 BeginRepair 是轮转铺满整屏，要十几帧、几百 KB。
+// 两者互补：小面积丢失走精确补发，大面积/开局走轮转。
+//
+// 掩码按条带下标解释（bit i = 条带 i），与 Frame.TilesMask 同一编码。
+// 超过当前条带数的位会被忽略（对方可能拿着旧的网格报上来，无害）。
+func (e *Encoder) RequestTiles(mask uint64) {
+	e.pendingTiles |= mask & allTilesMask(e.nTiles)
+}
+
+// PendingTiles 返回还没被消费的"点名条带"位图（诊断/测试用）。
+func (e *Encoder) PendingTiles() uint64 { return e.pendingTiles }
 
 // Config 返回生效配置。
 func (e *Encoder) Config() Config { return e.cfg }
@@ -248,6 +267,7 @@ func (e *Encoder) Encode(bgra []byte, w, h int) (*Frame, error) {
 			dirty[i] = i
 		}
 		e.repairLeft = 0 // 整帧都发了，修复轮次没必要继续
+		e.pendingTiles = 0
 	} else {
 		dirty = dirtyTiles(e.i420, e.prev, w, h, e.tileH, e.nTiles)
 		// 变化面积极大时，增量已无意义（省不了带宽还多付了比较开销）→ 转全量
@@ -258,9 +278,18 @@ func (e *Encoder) Encode(bgra []byte, w, h int) (*Frame, error) {
 				dirty[i] = i
 			}
 			e.repairLeft = 0
-		} else if e.repairLeft > 0 {
+			e.pendingTiles = 0
+		} else {
+			// 观众端点名的条带（精确补发）优先：一帧就能补齐，
+			// 比轮转铺满整屏省一个量级的流量。
+			if e.pendingTiles != 0 {
+				dirty = e.addPendingTiles(dirty)
+				e.pendingTiles = 0
+			}
 			// 渐进式修复：本帧额外轮转 repairStep 个条带（不管它们有没有变化）。
-			dirty = e.addRepairTiles(dirty)
+			if e.repairLeft > 0 {
+				dirty = e.addRepairTiles(dirty)
+			}
 		}
 	}
 	// TilesMask 描述的是**整个逻辑帧**（跨全部块），接收端据此判断丢了哪些条带。
@@ -375,6 +404,32 @@ func (e *Encoder) addRepairTiles(dirty []int) []int {
 	}
 	return dirty
 }
+
+// addPendingTiles 把观众端"点名"的条带并进 dirty（去重）。
+// 与 addRepairTiles 的区别：这是精确补发，一次就把缺的补齐，不轮转。
+func (e *Encoder) addPendingTiles(dirty []int) []int {
+	if e.pendingTiles == 0 || e.nTiles <= 0 {
+		return dirty
+	}
+	seen := make(map[int]struct{}, len(dirty))
+	for _, idx := range dirty {
+		seen[idx] = struct{}{}
+	}
+	for i := 0; i < e.nTiles && i < 64; i++ {
+		if e.pendingTiles&(1<<uint(i)) == 0 {
+			continue
+		}
+		if _, ok := seen[i]; ok {
+			continue
+		}
+		seen[i] = struct{}{}
+		dirty = append(dirty, i)
+	}
+	return dirty
+}
+
+// TileCount 返回当前条带总数（分辨率未知时为 0）。
+func (e *Encoder) TileCount() int { return e.nTiles }
 
 // allTilesMask 返回 nTiles 个条带全在的位图（nTiles 上限见 maxTiles。
 // 超出 64 个条带时退化为"最高位全 1"，接收端只会更保守）。

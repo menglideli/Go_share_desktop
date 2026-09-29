@@ -233,7 +233,11 @@ type Shell struct {
 func NewShell(cfg ShellConfig) *Shell {
 	s := &Shell{
 		cfg:          cfg,
-		frames:       make(chan *image.NRGBA, 2),
+		// ⚠️ 容量只能是 1：观看画面是"最新优先"，通道里压着的都是过期帧。
+		// 更深还会**抽干画面缓冲池** —— 池子总共 3 块，界面同时占着
+		// lastFrame(1) + 通道(2) 就没有余量给解码侧了（实测：池子用尽 → 走整帧
+		// 拷贝兜底 → 解码变慢 → 丢块）。
+		frames:       make(chan *image.NRGBA, 1),
 		route:        RouteHome,
 		preview:      nil,
 		regionReturn: RouteSetup,

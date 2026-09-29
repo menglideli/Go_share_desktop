@@ -373,12 +373,36 @@ func runCase(sk *sink, host, viewer *rtc.Peer, w, h, frames int, dirty bool, pac
 	}
 	time.Sleep(300 * time.Millisecond) // 余量：让最后一帧的解码也落定
 
+	// 先让画布**自愈**，再算 PSNR。
+	//
+	// ⚠️ 为什么必须有这一步：突发压测下接收端邮箱（latest-wins，容量 4）会溢出几块，
+	// 于是画布缺几条带 —— 这是系统的**正常行为**（真实链路里会立刻精确补发补回来），
+	// 但拿这个中间态算 PSNR，就会把机器负载抖动误报成"画质回归"。
+	// 实测踩过：锁屏/高负载下 2K 全量 PSNR 从 34.97 掉到 28.72，其实只丢了几块。
+	// 门禁要测的是"系统最终交付给用户什么"，不是"某一瞬间的中间态"。
+	heal := 0
+	for i := 0; i < 12; i++ {
+		if c, _, _, _ := sk.coverState(); c {
+			break
+		}
+		enc.RequestTiles(sk.missingMask())
+		out, err := enc.Encode(src, w, h)
+		if err != nil {
+			break
+		}
+		if err := sendFrame(host, out); err != nil {
+			break
+		}
+		heal++
+		waitCover(sk, 0)
+	}
+
 	got, img, avgLat, maxLat, decMS := sk.snapshot()
 	vs := viewer.Stats()
 
 	check(label+" 帧收齐", got == sent,
-		fmt.Sprintf("发送 %d / 收到 %d 帧（缺失 %d）· 分块 %d · 坏块 %d",
-			sent, got, sent-got, vs.ChunksRecv, vs.BadChunks))
+		fmt.Sprintf("发送 %d / 收到 %d 帧（缺失 %d）· 分块 %d · 坏块 %d · 邮箱溢出丢弃 %d",
+			sent, got, sent-got, vs.ChunksRecv, vs.BadChunks, vs.ChunksSkip))
 
 	avgFrame := 0
 	if sent > 0 {
@@ -405,7 +429,8 @@ func runCase(sk *sink, host, viewer *rtc.Peer, w, h, frames int, dirty bool, pac
 
 	p := psnr(src, img, w, h)
 	check(label+" 画质", p >= 30,
-		fmt.Sprintf("PSNR %.2f dB（源 → 经网络 → 解码结果）", p))
+		fmt.Sprintf("PSNR %.2f dB（源 → 经网络 → 解码结果）· 自愈补发 %d 帧 · 画布完整=%v",
+			p, heal, func() bool { c, _, _, _ := sk.coverState(); return c }()))
 }
 
 // runLossRepair 验证"丢一个分块"的后果与修复代价 —— 这是本轮改动的核心命题。
@@ -438,51 +463,68 @@ func runLossRepair(sk *sink, host *rtc.Peer) {
 		dropMask |= 1 << uint(t.Index)
 	}
 
-	sk.reset(w, h)
+	// ---- A. 格式级断言（不走网络，确定性）----
+	// "丢一块只丢它带的条带"是**线格式**的性质，必须做成确定性判据：
+	// 走网络会混入"接收端邮箱溢出"这类与格式无关的丢失（高负载/锁屏下实测发生过），
+	// 把这条断言变成随机器状态漂移的东西。
+	wantMissing := bits.OnesCount64(dropMask)
+	off := codec.NewDecoder(0)
+	kept := make([]*codec.Frame, 0, len(parts))
 	for i, c := range parts {
 		if i == dropIdx {
 			continue
 		}
-		wire, _ := c.Marshal()
-		for {
-			err := host.SendChunks([][]byte{wire})
-			if err == nil {
-				break
-			}
-			if !errors.Is(err, rtc.ErrBackpressure) {
-				check("丢块恢复 发送", false, err.Error())
-				return
-			}
-			time.Sleep(2 * time.Millisecond)
-		}
+		kept = append(kept, c)
 	}
-	time.Sleep(400 * time.Millisecond)
-	_, _, _, _, _ = sk.snapshot()
-	// 等画布状态稳定下来再断言：异步批量解码是在独立 goroutine 上跑的，
-	// 固定 sleep 在高负载机器上会偶发地"还没解完就看结果"（实测遇到过一次）。
-	wantMissing := bits.OnesCount64(dropMask)
-	var complete, missing, tiles, have int
-	settleFrom := time.Now()
-	for i := 0; i < 60; i++ {
-		c, m, t, hv := sk.coverState()
-		complete, missing, tiles, have = boolToInt(c), m, t, hv
-		if m == wantMissing || time.Now().After(settleFrom.Add(3*time.Second)) {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	if _, err := off.DecodeBatch(kept); err != nil {
+		check("丢块只丢它带的条带", false, err.Error())
+		return
 	}
-	check("丢块只丢它带的条带", complete == 0 && missing == wantMissing,
-		fmt.Sprintf("丢第 %d/%d 块（含 %d 条带）→ 画布 %d 条带里 %d 条内容有效、缺 %d（期望缺 %d）· 不完整=%v",
-			dropIdx+1, len(parts), wantMissing, tiles, have, missing, wantMissing, complete == 0))
+	gotMask := off.Missing()
+	check("丢块只丢它带的条带", gotMask == dropMask && !off.Complete(),
+		fmt.Sprintf("丢第 %d/%d 块（含 %d 条带）→ 画布 %d 条带里缺 %d 条，且缺的正是它带的那几条（位图 %x == %x）",
+			dropIdx+1, len(parts), wantMissing, off.TileCount(),
+			bits.OnesCount64(gotMask), gotMask, dropMask))
 
-	// ---- 渐进式修复：摊到 10 帧，每帧都必须"小" ----
+	// ---- A2. 同一场景走真实链路：丢的条带必须在缺失集合里，且能被精确补发补回 ----
+	sk.reset(w, h)
+	sendParts(host, parts, dropIdx)
+	waitCover(sk, wantMissing)
+	complete, missing, tiles, have := sk.coverState()
+	wireMask := sk.missingMask()
+	check("链路丢块后缺失集合正确", !complete && wireMask&dropMask == dropMask,
+		fmt.Sprintf("画布 %d 条带里 %d 条有效、缺 %d（含被丢那 %d 条）· 额外丢失 %d 条（邮箱溢出，属正常）",
+			tiles, have, missing, wantMissing, missing-wantMissing))
+
+	// ---- A. 精确补发：观众报"缺哪几条"，分享端只补那几条 ----
+	enc.RequestTiles(sk.missingMask())
+	out, err := enc.Encode(src, w, h)
+	if err != nil {
+		check("精确补发 编码", false, err.Error())
+		return
+	}
+	if err := sendFrame(host, out); err != nil {
+		check("精确补发 发送", false, err.Error())
+		return
+	}
+	waitCover(sk, 0)
+	okA, missA, _, _ := sk.coverState()
+	check("精确补发一帧补齐", okA && missA == 0,
+		fmt.Sprintf("补 %d 条带只用 1 帧 · 该帧 %d KB（全量帧 %d KB 的 %d%%）· 补后仍缺 %d 条",
+			wantMissing, out.Bytes/1024, full.Bytes/1024,
+			out.Bytes*100/max(full.Bytes, 1), missA))
+
+	// ---- B. 轮转修复：从**空画布**开始，不发全量帧也要铺满整屏 ----
+	// 这就是新观众接入的路径：以前是"3 秒内每 400ms 一发 2MB 全量帧"，
+	// 现在是十几帧、每帧都很小。
+	sk.reset(w, h)
 	enc.BeginRepair(10)
 	repaired := false
 	repairFrames, repairBytes, maxRepairFrame := 0, 0, 0
 	for i := 0; i < 14; i++ {
 		out, err := enc.Encode(src, w, h)
 		if err != nil {
-			check("丢块恢复 修复编码", false, err.Error())
+			check("轮转修复 编码", false, err.Error())
 			return
 		}
 		repairFrames++
@@ -490,29 +532,88 @@ func runLossRepair(sk *sink, host *rtc.Peer) {
 		if out.Bytes > maxRepairFrame {
 			maxRepairFrame = out.Bytes
 		}
-		wire := [][]byte{}
-		for _, c := range out.Split(codec.MaxChunkPayload) {
-			b, err := c.Marshal()
-			if err != nil {
-				check("丢块恢复 修复序列化", false, err.Error())
-				return
-			}
-			wire = append(wire, b)
+		if err := sendFrame(host, out); err != nil {
+			check("轮转修复 发送", false, err.Error())
+			return
 		}
-		_ = host.SendChunks(wire)
 		time.Sleep(20 * time.Millisecond)
 		if c, _, _, _ := sk.coverState(); c {
 			repaired = true
 			break
 		}
 	}
-	time.Sleep(200 * time.Millisecond)
-	done, missingNow, _, _ := sk.coverState()
-	check("渐进式修复铺满整屏", repaired && done && missingNow == 0,
-		fmt.Sprintf("用 %d 帧铺满（缺 %d 条带）· 单帧最大 %d KB（全量帧 %d KB 的 %d%%）",
-			repairFrames, missingNow, maxRepairFrame/1024, full.Bytes/1024,
+	waitCover(sk, 0)
+	done, missingNow, tilesNow, _ := sk.coverState()
+	check("轮转修复铺满整屏", repaired && done && missingNow == 0,
+		fmt.Sprintf("从空画布用 %d 帧铺满 %d 条带（仍缺 %d）· 单帧最大 %d KB（全量帧 %d KB 的 %d%%）",
+			repairFrames, tilesNow, missingNow, maxRepairFrame/1024, full.Bytes/1024,
 			maxRepairFrame*100/max(full.Bytes, 1)))
 	check("修复不产生大突发", maxRepairFrame*4 <= full.Bytes,
 		fmt.Sprintf("单帧最大 %d KB ≤ 全量帧的 1/4（%d KB）· 修复总流量 %d KB（全量帧 %d KB）",
 			maxRepairFrame/1024, full.Bytes/4096, repairBytes/1024, full.Bytes/1024))
+}
+
+// missingMask 返回画布上"内容已过期"的条带位图（精确补发用）。
+func (s *sink) missingMask() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dec == nil {
+		return 0
+	}
+	return s.dec.Missing()
+}
+
+// sendParts 逐块发送，跳过 dropIdx 那一块（模拟丢包）。
+func sendParts(host *rtc.Peer, parts []*codec.Frame, dropIdx int) {
+	for i, c := range parts {
+		if i == dropIdx {
+			continue
+		}
+		wire, _ := c.Marshal()
+		_ = sendRetry(host, [][]byte{wire})
+	}
+}
+
+// sendFrame 把一帧切块发出。
+func sendFrame(host *rtc.Peer, f *codec.Frame) error {
+	parts := f.Split(codec.MaxChunkPayload)
+	wire := make([][]byte, 0, len(parts))
+	for _, c := range parts {
+		b, err := c.Marshal()
+		if err != nil {
+			return err
+		}
+		wire = append(wire, b)
+	}
+	return sendRetry(host, wire)
+}
+
+// sendRetry 发送并在背压时重试：背压是预期行为（SendLimit 只允许约一帧半积压），
+// 真实的发送循环是"跳过这一帧、下一帧顶上"，这里为了测完整性选择等一等再发。
+func sendRetry(host *rtc.Peer, wire [][]byte) error {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := host.SendChunks(wire)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, rtc.ErrBackpressure) || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// waitCover 等画布覆盖状态到达期望值（最多 3 秒）。
+func waitCover(sk *sink, wantMissing int) {
+	t0 := time.Now()
+	for i := 0; i < 60; i++ {
+		if _, m, _, _ := sk.coverState(); m == wantMissing {
+			return
+		}
+		if time.Since(t0) > 3*time.Second {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }

@@ -15,6 +15,7 @@
 package rtc
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -489,7 +490,29 @@ const (
 	CtlStats CtlType = 3
 	// CtlBye 主动断开。
 	CtlBye CtlType = 4
+	// CtlMissing 观众上报"画布上内容已过期的条带位图"，请分享端**只补这几条**。
+	//
+	// 为什么要有它：光靠 CtlPLI（开一轮渐进式修复）意味着"缺 2 条带也要把
+	// 整屏 17 条带轮着发一遍"（十几帧、几百 KB）。观众端本来就知道自己缺哪几条
+	// （codec.Decoder.Missing），报上来就能一帧补齐、只花几十 KB。
+	// payload = 8 字节大端位图，编码与 Frame.TilesMask 一致。
+	CtlMissing CtlType = 5
 )
+
+// MissingPayload 把条带位图编码成 CtlMissing 的 payload。
+func MissingPayload(mask uint64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, mask)
+	return b
+}
+
+// ParseMissing 解析 CtlMissing 的 payload。
+func ParseMissing(payload []byte) (uint64, bool) {
+	if len(payload) < 8 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(payload[:8]), true
+}
 
 // SendControl 发送控制消息（可靠通道）。
 func (p *Peer) SendControl(t CtlType, payload []byte) error {
