@@ -100,6 +100,7 @@ func main() {
 		keyInterval: *keyInterval, keyBurst: *keyBurst,
 		switchAt: *switchAt, switchRegion: *switchRegion,
 		switchDisp: *switchDisp, displays: ds,
+		disp: newDispPool(),
 	}
 	title := "GoShare · 内网桌面共享"
 	if version != "dev" {
@@ -111,6 +112,10 @@ func main() {
 		Displays: ds,
 		Presets:  names,
 		ExitAfter: *exitAfter,
+
+		// 观看画面缓冲池的归还通道（见 viewbuf.go）：
+		// 渲染线程换掉上一帧时把缓冲还回来复用，省掉每帧 20MB 的分配。
+		Recycle: a.disp.Recycle(),
 
 		OnStartShare: a.startShare,
 		OnStopShare:  a.stopShare,
@@ -205,6 +210,8 @@ type app struct {
 	ann     *discover.Announcer
 	stop    context.CancelFunc
 	stopHUD chan struct{}
+	// hud 是分享中的置顶悬浮条（主窗最小化后屏幕上唯一的状态/停止入口）。
+	hud *ui.HUD
 	// shCtx 是本次分享的上下文（换屏时新建采集源要用它，保证停止分享时一起收掉）。
 	shCtx context.Context
 	region  capture.Rect
@@ -227,6 +234,28 @@ type app struct {
 	wDec      float64
 	wNonBlack float64
 	wLum      float64
+	// wLatMS 是端到端延迟（毫秒，滑动均值）：帧里的 TS → 本地收到的时刻。
+	//
+	// 只有 fps 和带宽是答不了"延迟到底多少"的 —— 而这次优化的目标恰恰是延迟，
+	// 没有这个指标就只能靠感觉。
+	wLatMS float64
+	// wChunks 是收到的**分块**数（一帧由多块组成，见 codec.Frame）。
+	wChunks uint64
+	// wLastSeq 是最近一次上屏的帧序号：分块按帧推进时，只有跨帧才把画面交给界面
+	// （否则一帧会被推三次，白白多做两次同步）。
+	wLastSeq atomic.Uint64
+	// disp 是观看端画面缓冲池：复用内存 + 只同步变化过的条带（见 viewbuf.go）。
+	disp *dispPool
+	// wSkipped 是"解码跟不上被丢掉"的**分块**数（AsyncFrames 的单槽邮箱覆盖）。
+	// 它不是网络问题，是本地解码产能问题，必须与网络丢块分开看。
+	wSkipped atomic.Uint64
+	// dropLogAt 给丢块日志降频（丢块可能每秒几十次，不能每次都打）。
+	dropLogAt atomic.Int64
+	// lastRepairAt 是最近收到"修复轮次帧"的时刻（UnixNano）：修复在飞时不必重复请求。
+	lastRepairAt atomic.Int64
+	// pliBackoffMs 是请求修复的退避间隔（毫秒）：300 → 600 → 1200 → 2000。
+	// 固定 300ms 猛敲会在拥塞时变成"越要越堵"。
+	pliBackoffMs atomic.Int64
 	// wICE 是当前 ICE 连接状态（webrtc.ICEConnectionState 底层是 int）。
 	//
 	// 需要它是因为"收不到帧"有好几种原因：对方停止分享、自己网络断了、
@@ -262,13 +291,11 @@ type app struct {
 	reconnecting atomic.Bool
 
 	// ---- 观看端画面完整性（R32）----
-	// needFull：当前画布不完整，需要一帧全量。初始为 true —— 观众在收到
-	// 第一帧全量之前，画布上什么都没有，这是"开局大片黑"的根因。
+	// needFull：当前画布不完整，需要请对端开一轮修复。初始为 true —— 观众在收到
+	// 第一批分块之前，画布上什么都没有。
 	needFull atomic.Bool
-	// lastPLI 是上次请求全量帧的时刻（UnixNano），用于限流。
+	// lastPLI 是上次请求修复的时刻（UnixNano），用于限流 + 退避。
 	lastPLI atomic.Int64
-	// lastFrag 是上次观察到的重组丢帧计数，用来发现"悄悄丢了分片"。
-	lastFrag atomic.Uint64
 	// peerBox 让 OnFrame 回调能拿到 peer（它要等 Dial 返回后才存在）。
 	peerBox atomic.Pointer[rtc.Peer]
 
@@ -276,28 +303,74 @@ type app struct {
 	pliTarget *rtc.Peer
 }
 
-// pliMinInterval 是请求全量帧的最小间隔。
+// pliMinInterval 是请求修复的最小间隔；pliMaxBackoff 是退避上限。
 //
-// 不能太密：每次请求都会让编码器放弃 dirty 增量、重编一整帧，
-// 请求过密反而互相打断，把恢复拖慢。
-const pliMinInterval = 300 * time.Millisecond
+// 不能太密：每次请求都会让编码器开一轮渐进式修复（每帧多带 1/10 条带），
+// 请求过密反而互相打断，把恢复拖慢；拥塞时更是"越要越堵"。
+const (
+	pliMinInterval = 300 * time.Millisecond
+	pliMaxBackoff  = 2 * time.Second
+)
 
-// sendPLI 请分享端尽快发一帧全量（走可靠有序的 ctl 通道）。
+// sendPLI 请分享端开一轮**渐进式修复**（走可靠有序的 ctl 通道）。
+//
+// 退避是必须的：固定 300ms 猛敲，在拥塞时就是"越要越堵、越堵越黑"的正反馈。
+// 每发一次退避翻倍（上限 2 秒），收到修复轮次的帧就复位。
 func (a *app) sendPLI(p *rtc.Peer) {
 	if p == nil {
 		return
 	}
+	wait := time.Duration(a.pliBackoffMs.Load()) * time.Millisecond
+	if wait < pliMinInterval {
+		wait = pliMinInterval
+	}
 	now := time.Now().UnixNano()
 	last := a.lastPLI.Load()
-	if last != 0 && now-last < int64(pliMinInterval) {
+	if last != 0 && now-last < int64(wait) {
 		return
 	}
 	if !a.lastPLI.CompareAndSwap(last, now) {
 		return
 	}
-	if err := p.SendControl(rtc.CtlPLI, nil); err != nil {
-		log.Printf("请求全量帧失败: %v", err)
+	// 退避翻倍（上限见 pliMaxBackoff）。
+	next := a.pliBackoffMs.Load() * 2
+	if next < int64(pliMinInterval/time.Millisecond) {
+		next = int64(pliMinInterval / time.Millisecond)
 	}
+	if next > int64(pliMaxBackoff/time.Millisecond) {
+		next = int64(pliMaxBackoff / time.Millisecond)
+	}
+	a.pliBackoffMs.Store(next)
+	if err := p.SendControl(rtc.CtlPLI, nil); err != nil {
+		log.Printf("请求修复失败: %v", err)
+	}
+}
+
+// requestRepair 在"画布不完整"时请对端开一轮修复（带退避与去重）。
+func (a *app) requestRepair(f *codec.Frame) {
+	now := time.Now().UnixNano()
+	if f.Refresh != 0 {
+		// 对端正在做修复（这一帧带修复轮次）：它会在十几帧内铺满整屏，
+		// 此时再要就是白要 —— 记下时刻、把退避复位。
+		a.lastRepairAt.Store(now)
+		a.pliBackoffMs.Store(0)
+		return
+	}
+	if last := a.lastRepairAt.Load(); now-last < int64(time.Second) {
+		return
+	}
+	a.sendPLI(a.peerBox.Load())
+}
+
+// tileMask 把一块里携带的条带下标折成位图（与 codec 的 TilesMask 同一编码）。
+func tileMask(f *codec.Frame) uint64 {
+	var m uint64
+	for _, t := range f.Tiles {
+		if t.Index >= 0 && t.Index < 64 {
+			m |= 1 << uint(t.Index)
+		}
+	}
+	return m
 }
 
 // ---------------------------------------------------------------------------
@@ -404,13 +477,13 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 					}()
 				}
 			},
-			// 观众端发现自己没有完整画面时会发 PLI（R32）。
+			// 观众端发现画布不完整时会发 PLI（R32 / R39）。
 			// 这条请求走的是可靠有序的 ctl 通道，比 media 通道可靠得多，
 			// 是观众侧唯一能主动自救的手段。
 			OnControl: func(t rtc.CtlType, payload []byte) {
 				if t == rtc.CtlPLI {
-					log.Printf("观众 %s 请求全量帧", req.RemoteIP)
-					sh.RequestKeyFrame()
+					log.Printf("观众 %s 请求修复轮次", req.RemoteIP)
+					sh.RequestRepair()
 				}
 			},
 		})
@@ -437,17 +510,15 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 		// non-trickle：等候选收齐，answer 里才带得上 UDP 端口
 		peer.WaitGathering(3 * time.Second)
 		sh.AddPeer(peer)
-		// AddPeer 里的 ForceKeyFrame 只是置标志，真正的全量帧要到下一帧编码
-		// （~33ms 后）才产生。那一刻 DataChannel 往往还没 open（DTLS 握手未完成），
-		// SendFrame 直接返回 ErrNotOpen 把这一帧丢掉 —— 而编码器已经把
-		// havePrev 置为 true，全量帧只此一次，观众端于是**永远**缺初始画面：
-		// 实测开局只拿到 11.8% 的内容，全靠桌面大幅变化偶然触发全量才补全（R32）。
-		// 通道就绪后再补一次请求，才算稳。
+		// AddPeer 里开的那轮修复是"渐进式"的：编码发生在下一帧（~33ms 后），
+		// 那一刻 DataChannel 往往还没 open（DTLS 握手未完成），SendChunks 直接
+		// 返回 ErrNotOpen 把这一帧丢掉；而修复轮次只有一轮，观众端于是**缺初始画面**
+		// （实测 R32：开局只拿到 11.8% 的内容）。通道就绪后再补一次请求，才算稳。
 		go func() {
 			if err := peer.WaitReady(15 * time.Second); err != nil {
 				return
 			}
-			sh.RequestKeyFrame()
+			sh.RequestRepair()
 		}()
 		log.Printf("观众 %s（%s）已接入，当前 %d 人", req.Viewer, req.RemoteIP, sh.PeerCount())
 		return *peer.PC().LocalDescription(), func() { cleanup("正常断开") }, nil
@@ -532,6 +603,26 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 		}
 	}
 	go a.hudLoop(hudStop)
+
+	// 置顶悬浮条：主窗最小化（防自摄入）后，它是屏幕上唯一能看到
+	// "谁在看我 + 停止分享"的地方。OnStop 在 HUD 窗口 goroutine 里触发，
+	// stopShare / Go / RestoreMainWindow 都是锁安全或异步的，可直接调。
+	hud := ui.NewHUD(ui.HUDConfig{
+		Title: ui.HUDWindowTitle,
+		OnStop: func() {
+			a.stopShare()
+			a.shell.Go(ui.RouteHome)
+			go func() {
+				if err := ui.RestoreMainWindow(); err != nil {
+					log.Printf("hud: 停止后恢复主窗失败：%v（双击托盘图标可恢复）", err)
+				}
+			}()
+		},
+	})
+	hud.Start()
+	a.mu.Lock()
+	a.hud = hud
+	a.mu.Unlock()
 
 	log.Printf("分享已开始：端口 %d 授权码 %s 地址 %v", srv.Port(), srv.Code(), srv.ShareAddrs())
 	printFirewallHint(srv.Port())
@@ -682,17 +773,36 @@ func (a *app) pushShareState() {
 		RegionText: regionText,
 		SrcText:    fmt.Sprintf("%.1f fps", st.FPS),
 	})
+
+	// 悬浮条：满血时显示档位名，被自适应降档后带上当前质量 ——
+	// 画面变糊时用户能直接看到原因，而不是猜"是不是网络坏了"。
+	level, _, aq, _ := sh.AdaptiveState()
+	qualityText := presetNameOf(sh)
+	if level > 0 {
+		qualityText = fmt.Sprintf("%s·q%d", qualityText, aq)
+	}
+	a.mu.Lock()
+	hudWin := a.hud
+	a.mu.Unlock()
+	if hudWin != nil {
+		hudWin.SetState(len(rows), qualityText, sh.Paused())
+	}
 }
 
 func (a *app) stopShare() {
 	a.mu.Lock()
 	hadSession := a.sh != nil || a.srv != nil
 	sh, srv, ann, cancel, hudStop := a.sh, a.srv, a.ann, a.stop, a.stopHUD
+	hudWin := a.hud
 	a.sh, a.srv, a.ann, a.stop, a.stopHUD = nil, nil, nil, nil, nil
+	a.hud = nil
 	a.shCtx = nil
 	a.view = nil
 	a.mu.Unlock()
 
+	if hudWin != nil {
+		hudWin.Stop()
+	}
 	if hudStop != nil {
 		close(hudStop)
 	}
@@ -872,10 +982,15 @@ func (a *app) join(addr, code string) {
 	go func() {
 		a.mu.Lock()
 		a.wFrames, a.wBytes, a.wStart, a.wDec = 0, 0, time.Now(), 0
+		a.wLatMS = 0
+		a.wChunks = 0
 		a.mu.Unlock()
-		// 新接入 = 画布从零开始：在收到第一帧全量之前，画布上什么都还没有（R32）。
+		a.wSkipped.Store(0)
+		a.wLastSeq.Store(0)
+		a.pliBackoffMs.Store(0)
+		a.lastRepairAt.Store(0)
+		// 新接入 = 画布从零开始：一块都没到之前画布上是空的。
 		a.needFull.Store(true)
-		a.lastFrag.Store(0)
 		a.peerBox.Store(nil)
 
 		dec := codec.NewDecoder(0)
@@ -942,6 +1057,20 @@ func (a *app) dialOnce(dec *codec.Decoder, addr, code string) (*signal.Session, 
 			Peer: rtc.Config{
 				UDPPortMin: udpPortMin,
 				UDPPortMax: udpPortMax,
+				// 解码搬出 SCTP 读 goroutine（见 rtc.Config.AsyncFrames）。
+				// 不这么做的话，读路径被我们自己的解码（2K 约 10~20ms/帧）堵住，
+				// 帧在接收缓冲里排队 → 延迟单调增长，连 PLI 都发不及时。
+				AsyncFrames: true,
+				// 丢掉一块 = 它带的条带更新永远没了（增量帧不会重发）。
+				// 必须让状态循环去要对端开一轮修复，否则就是"永久缺一块"（R32 同类）。
+				OnFrameDrop: func() {
+					a.wSkipped.Add(1)
+					a.needFull.Store(true)
+					now := time.Now().UnixNano()
+					if last := a.dropLogAt.Load(); now-last > int64(time.Second) && a.dropLogAt.CompareAndSwap(last, now) {
+						log.Printf("观看端解码跟不上，丢弃积压分块（累计 %d）—— 已请求修复轮次补画布", a.wSkipped.Load())
+					}
+				},
 				// OnState 只做记录与打日志 —— 它跑在 ICE agent 的内部 goroutine 上，
 				// 任何会等待 ICE 的动作（尤其是 Close）都会和 agent 收尾互等死锁，
 				// 表现为进程静默卡死（PLAN 约束 8）。
@@ -959,36 +1088,93 @@ func (a *app) dialOnce(dec *codec.Decoder, addr, code string) (*signal.Session, 
 					a.needFull.Store(true)
 				}
 			},
-				OnFrame: func(f *codec.Frame) {
+				OnFrames: func(batch []*codec.Frame) {
+					// ⚠️ 这里收到的每个元素是**一个分块**，不是一个完整帧：
+					// 分块丢了就少解几个条带，其余照常上屏（"丢一块不再废整帧"）。
+					// 一批一起解：单块只带 1~2 个条带，逐块串行会把帧内并行度丢光
+					// （实测 2K 全量解码 7ms → 98ms）。
 					a.wLastFrameAt.Store(time.Now().UnixNano())
-					img, err := dec.Decode(f)
+					img, err := dec.DecodeBatch(batch)
 					if err != nil {
 						return
 					}
-					nb, lum := pixStat(img.Pix, img.Bounds().Dx(), img.Bounds().Dy())
+					// 尺寸（或条带切分）变了 → 界面缓冲池重建（旧缓冲尺寸不对）。
+					if b := img.Bounds(); a.disp.W() != b.Dx() || a.disp.H() != b.Dy() {
+						a.disp.Reset(b.Dx(), b.Dy(), batch[0].TileH, batch[0].TotalTiles)
+					}
+					var (
+						bytes   int
+						latSum  float64
+						latN    int
+						lastSeq uint64
+						newSeq  bool
+					)
+					for _, f := range batch {
+						// 记下这一块带的条带：界面缓冲池据此知道要补哪几行。
+						a.disp.MarkDirty(tileMask(f))
+						bytes += f.Bytes
+						// 端到端延迟：帧里的 TS（编码端 Unix 毫秒低 32 位）→ 现在。
+						// 用 32 位回绕差，两端时钟差会自然抵消；同机测试尤其准。
+						lat := float64(int32(uint32(time.Now().UnixMilli()) - uint32(f.TS)))
+						if lat >= 0 {
+							latSum += lat
+							latN++
+						}
+						if f.Seq != a.wLastSeq.Load() {
+							a.wLastSeq.Store(f.Seq)
+							newSeq = true
+						}
+						lastSeq = f.Seq
+					}
+					a.mu.Lock()
+					a.wChunks += uint64(len(batch))
+					a.wBytes += uint64(bytes)
+					// DecodeMs 是这一批的解码耗时（同一批往往就是同一帧的几块）。
+					a.wDec = dec.DecodeMs
+					if latN > 0 {
+						lat := latSum / float64(latN)
+						// 滑动均值（0.2 权重 ≈ 最近 5 批），单批抖动不误导用户。
+						if a.wLatMS == 0 {
+							a.wLatMS = lat
+						} else {
+							a.wLatMS = a.wLatMS*0.8 + lat*0.2
+						}
+					}
+					a.mu.Unlock()
+
+					// ---- 帧边界：这一批跨到了新的一帧，说明上一帧的块都到齐了 ----
+					// 只有跨帧才把画面交给界面（每帧一次），否则一帧会被推好几次。
+					if !newSeq {
+						return
+					}
 					a.mu.Lock()
 					a.wFrames++
-					a.wBytes += uint64(f.Bytes)
-					a.wDec = dec.DecodeMs
-					a.wNonBlack, a.wLum = nb, lum
 					n := a.wFrames
 					path := a.dumpPath
 					at := a.dumpAt
 					a.mu.Unlock()
-					// 画面完整性（R32）：只有全量帧才能把画布填满，增量帧
-					// 只更新"变化过的"条带。没拿到全量就立刻请对方补一帧，
-					// 不能指望桌面碰巧大幅变化去触发（实测等了 12 秒）。
-					if f.Full {
-						a.needFull.Store(false)
-					} else if a.needFull.Load() {
-						a.sendPLI(a.peerBox.Load())
+
+					// 逐像素统计**降频**：它每帧扫 30 万像素，纯诊断用，
+					// 没必要为了日志把解码 goroutine 占满。
+					if n%5 == 1 {
+						nb, lum := pixStat(img.Pix, img.Bounds().Dx(), img.Bounds().Dy())
+						a.mu.Lock()
+						a.wNonBlack, a.wLum = nb, lum
+						a.mu.Unlock()
 					}
-					// 前几帧与每次全量帧都记一笔：用来回答"观众拿到的是不是
-					// 从完整画面开始" —— 增量帧只能更新变化区域，缺了初始全量帧，
-					// 静止区域就永远是黑的（实测踩过）。
-					if n <= 5 || f.Full {
-						log.Printf("收到帧 #%d seq=%d 全量=%v 条带 %d/%d %dx%d 非黑 %.1f%%",
-							n, f.Seq, f.Full, len(f.Tiles), f.TotalTiles, f.W, f.H, nb*100)
+
+					// 画面完整性：判据是我们自己维护的"条带是否都是当前内容"
+					// （codec.Decoder.Complete），不再是"收到过全量帧" ——
+					// 新格式下丢一块只丢几条带，缺的那几条会被精确标出来。
+					complete := dec.Complete()
+					a.needFull.Store(!complete)
+					if !complete {
+						a.requestRepair(batch[len(batch)-1])
+					}
+					f0 := batch[len(batch)-1]
+					if n <= 5 || f0.Full || f0.Refresh != 0 {
+						log.Printf("收到帧 #%d seq=%d（本批 %d 块）全量=%v 修复轮次=%d %dx%d 画布完整=%v",
+							n, lastSeq, len(batch), f0.Full, f0.Refresh, f0.W, f0.H, complete)
 					}
 					if path != "" && n == at {
 						log.Printf("诊断：把观看端第 %d 帧（%dx%d）落到 %s",
@@ -997,9 +1183,12 @@ func (a *app) dialOnce(dec *codec.Decoder, addr, code string) (*signal.Session, 
 							log.Printf("诊断：落盘失败: %v", err)
 						}
 					}
-					// 直接给界面新画布：解码器内部缓冲会被下一帧覆盖，
-					// 与渲染线程共用同一块内存会直接崩（阶段 2 踩过）。
-					a.shell.PushFrame(copyNRGBA(img))
+					// 交给界面：从**缓冲池**取一块（已经与解码画布同步）。
+					// 不再每帧新分配 20MB —— 那等于 600MB/s 的垃圾，
+					// 解码 goroutine 会被 GC 拖住，进而丢块。
+					if buf := a.disp.Take(dec); buf != nil {
+						a.shell.PushFrame(buf)
+					}
 				},
 			},
 	})
@@ -1052,11 +1241,15 @@ func (a *app) reconnect(dec *codec.Decoder, dead *signal.Session) {
 		}
 		a.sess = sess
 		a.wFrames, a.wBytes, a.wStart, a.wDec = 0, 0, time.Now(), 0
+		a.wLatMS = 0
+		a.wChunks = 0
 		a.mu.Unlock()
 		a.peerBox.Store(sess.Peer)
 		a.needFull.Store(true)
-		a.lastFrag.Store(0)
-		log.Printf("自动重连成功（%s），已请求全量帧", sess.Info.Name)
+		a.wLastSeq.Store(0)
+		a.pliBackoffMs.Store(0)
+		a.lastRepairAt.Store(0)
+		log.Printf("自动重连成功（%s），已请求修复轮次补画布", sess.Info.Name)
 		return
 	}
 	log.Printf("自动重连 12 次都失败，放弃（可回到接入页手动重连）")
@@ -1090,7 +1283,8 @@ func (a *app) watchStatusLoop(dec *codec.Decoder) {
 			fps = float64(a.wFrames) / el
 			mbps = float64(a.wBytes) * 8 / el / 1e6
 		}
-		st := fmt.Sprintf("%s · %.1f fps · %.1f Mbps · 解码 %.1f ms", sess.Info.Name, fps, mbps, a.wDec)
+		st := fmt.Sprintf("%s · %.1f fps · %.1f Mbps · 解码 %.1f ms · 延迟 %.0f ms",
+			sess.Info.Name, fps, mbps, a.wDec, a.wLatMS)
 		nb, lum, fr := a.wNonBlack, a.wLum, a.wFrames
 		a.mu.Unlock()
 
@@ -1151,22 +1345,21 @@ func (a *app) watchStatusLoop(dec *codec.Decoder) {
 		}
 		a.shell.SetJoinState(js)
 		ps := sess.Peer.Stats()
-		// 丢分片 = 画布上少了一块，而且少的那块不会自己回来（增量帧只覆盖
-		// 变化区域）→ 立刻请全量。sendPLI 自带 300ms 限流，持续丢就是持续重试。
-		if prev := a.lastFrag.Swap(ps.FragLost); ps.FragLost > prev {
-			log.Printf("检测到分片丢失（累计 %d 帧），请求全量帧", ps.FragLost)
-			a.needFull.Store(true)
-		}
+		// 画布不完整（丢块 / 丢帧 / 刚接入）→ 请对端开一轮渐进式修复。
+		// 退避与"修复在飞就不重复要"都在 sendPLI/requestRepair 里。
 		if a.needFull.Load() {
 			a.sendPLI(sess.Peer)
 		}
 		ticks++
 		if ticks%6 == 0 {
 			// 每 3s 一条：非黑占比是"画面真的到了"的像素级证据。
-			// 碎片丢（FragLost）单列 —— 它是"画面缺一块"的直接嫌疑：
-			// 一个全量帧有上百个分片，丢 1 片整帧就废，而观众端不会自动补。
-			log.Printf("观看统计：%s · 非黑 %.1f%% · 亮度 %.1f · 已收 %d 帧 · 重组丢帧 %d",
-				st, nb*100, lum, fr, ps.FragLost)
+			// 解码跳块（本地产能不足）与坏块（对端/协议问题）单列，
+			// 别把"我自己解不过来"错当成"网络丢了"。
+			a.mu.Lock()
+			chunks := a.wChunks
+			a.mu.Unlock()
+			log.Printf("观看统计：%s · 非黑 %.1f%% · 亮度 %.1f · 已收 %d 帧/%d 块 · 解码跳块 %d · 坏块 %d · 画布完整=%v",
+				st, nb*100, lum, fr, chunks, a.wSkipped.Load(), ps.BadChunks, !a.needFull.Load())
 		}
 	}
 }
@@ -1249,11 +1442,9 @@ func pixStat(pix []byte, w, h int) (nonBlack, meanLum float64) {
 	return float64(nb) / float64(n), float64(sum) / float64(n)
 }
 
-func copyNRGBA(src *image.NRGBA) *image.NRGBA {
-	dst := image.NewNRGBA(src.Bounds())
-	copy(dst.Pix, src.Pix)
-	return dst
-}
+// 注意：这里**没有** copyNRGBA 了。观看画面以前是"解码器画布整帧拷一份"
+// （2K 一次 20MB，每帧一次），现在是 cmd/goshare/viewbuf.go 的缓冲池：
+// 复用固定两块内存，只同步变化过的条带，交给界面时零拷贝。
 
 // savePNG 把一帧原样落盘（诊断用）。
 func savePNG(path string, img image.Image) error {

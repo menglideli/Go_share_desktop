@@ -11,9 +11,11 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"image"
 	"math"
+	"math/bits"
 	"os"
 	"sync"
 	"time"
@@ -35,12 +37,14 @@ func check(name string, ok bool, detail string) {
 	}
 }
 
-// sink 是观看端的落点：收帧 → 解码 → 统计。
+// sink 是观看端的落点：收分块 → 解码 → 统计。
 type sink struct {
-	mu     sync.Mutex
-	dec    *codec.Decoder
-	got    int
-	last   *image.NRGBA
+	mu      sync.Mutex
+	dec     *codec.Decoder
+	got     int // 逻辑帧数（按 seq 去重）
+	chunks  int
+	lastSeq uint64
+	last    *image.NRGBA
 	// sentAt 记录每帧的发送时刻。延迟用它算，而不是帧里的 TS：
 	// 线格式里 TS 只有 32 位（Unix 毫秒被截断），直接相减会得到天文数字。
 	// 跨机器时还需要时钟同步，本机同进程则完全可信。
@@ -68,31 +72,48 @@ func (s *sink) markSent(seq uint64) {
 	s.mu.Unlock()
 }
 
-func (s *sink) onFrame(f *codec.Frame) {
+func (s *sink) onFrames(batch []*codec.Frame) {
+	if len(batch) == 0 {
+		return
+	}
+	// 与应用同一条路径：一批块一起解（单块只带 1~2 个条带，逐块解会把
+	// 帧内并行度丢光 —— 实测 2K 全量 7ms → 90ms）。
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.dec == nil {
 		return
 	}
-	// ⚠️ 解码必须在锁内：解码器写的是同一块持久画布，
-	// 而 pion 的消息回调可能并发进入 —— 锁外解码会让两块条带互相撕裂，
-	// 表现就是 PSNR 从 34dB 掉到 19dB，而且不是每次都复现。
-	img, err := s.dec.Decode(f)
+	img, err := s.dec.DecodeBatch(batch)
 	if err != nil {
 		return
 	}
-	s.got++
+	// 收到的每个消息是一**块**（一帧可能多块）：帧数按 seq 去重，
+	// 块数单独计 —— 否则"发送 30 / 收到 90"会看着像收了 3 倍帧。
+	s.chunks += len(batch)
+	for _, f := range batch {
+		if f.Seq != s.lastSeq {
+			s.lastSeq = f.Seq
+			s.got++
+		}
+		if t, ok := s.sentAt[f.Seq]; ok {
+			lat := float64(time.Since(t).Microseconds()) / 1000.0
+			s.latSum += lat
+			s.latN++
+			if lat > s.latMax {
+				s.latMax = lat
+			}
+			delete(s.sentAt, f.Seq)
+		}
+	}
 	s.last = img
 	s.decMS += s.dec.DecodeMs
-	if t, ok := s.sentAt[f.Seq]; ok {
-		lat := float64(time.Since(t).Microseconds()) / 1000.0
-		s.latSum += lat
-		s.latN++
-		if lat > s.latMax {
-			s.latMax = lat
-		}
-		delete(s.sentAt, f.Seq)
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
 	}
+	return 0
 }
 
 func (s *sink) snapshot() (got int, img *image.NRGBA, avgLat, maxLat, decMS float64) {
@@ -103,6 +124,20 @@ func (s *sink) snapshot() (got int, img *image.NRGBA, avgLat, maxLat, decMS floa
 		avg = s.latSum / float64(s.latN)
 	}
 	return s.got, s.last, avg, mx, s.decMS
+}
+
+// coverState 报告画布是否"每个条带都是当前内容"，以及缺多少条带。
+// 判据来自解码器的完整性位图（丢块会被精确标出来，不是笼统的"收没收到全量帧"）。
+// 同时返回条带总数与"内容有效"的条带数，便于核对统计口径。
+func (s *sink) coverState() (bool, int, int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dec == nil {
+		return false, 0, 0, 0
+	}
+	tiles := s.dec.TileCount()
+	have := bits.OnesCount64(s.dec.Have())
+	return s.dec.Complete(), bits.OnesCount64(s.dec.Missing()), tiles, have
 }
 
 func makeFrame(w, h int) []byte {
@@ -181,7 +216,9 @@ func main() {
 	t0 := time.Now()
 
 	viewer, err := rtc.NewPeer(rtc.Config{
-		OnFrame: sk.onFrame,
+		// 与生产观看端同一条路径：异步 + 批量解析解码。
+		AsyncFrames: true,
+		OnFrames:    sk.onFrames,
 		OnControl: func(t rtc.CtlType, payload []byte) {
 			if t == rtc.CtlPLI {
 				sk.mu.Lock()
@@ -260,6 +297,9 @@ func main() {
 	fmt.Printf("\n[3] 1080p · 40 帧 · 增量（观众端累积，验证不漂移）\n")
 	runCase(sk, host, viewer, 1920, 1080, 40, true, 33*time.Millisecond)
 
+	fmt.Printf("\n[4] 丢块恢复：故意丢 1 个分块，验证「只丢它带的条带」+ 渐进式修复\n")
+	runLossRepair(sk, host)
+
 	fmt.Printf("\n------------------------------------------------------------\n")
 	fmt.Printf("结果: %d 通过 / %d 失败\n\n", pass, fail)
 	if fail > 0 {
@@ -268,7 +308,7 @@ func main() {
 	os.Exit(0)
 }
 
-// runCase 跑一轮：编码 → 发送 →（异步）重组解码 → 断言。
+// runCase 跑一轮：编码 → 发送 →（异步）批量解码 → 断言。
 func runCase(sk *sink, host, viewer *rtc.Peer, w, h, frames int, dirty bool, pace time.Duration) {
 	label := fmt.Sprintf("%dx%d", w, h)
 	if dirty {
@@ -298,9 +338,20 @@ func runCase(sk *sink, host, viewer *rtc.Peer, w, h, frames int, dirty bool, pac
 			maxFrame = f.Bytes
 		}
 		sk.markSent(f.Seq)
-		if err := host.SendFrame(f); err != nil {
-			check(label+" 发送", false, err.Error())
-			return
+		// 背压是**预期行为**（SendLimit 只允许约一帧半的积压）：突发发送时
+		// 等一等再发，而不是把这一帧算作失败 —— 真实的发送循环也是这么做的
+		// （跳过这一帧、下一帧顶上）。这里为了测吞吐/延迟/画质，选择重试。
+		sendDeadline := time.Now().Add(10 * time.Second)
+		for {
+			err = host.SendFrame(f)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, rtc.ErrBackpressure) || time.Now().After(sendDeadline) {
+				check(label+" 发送", false, err.Error())
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
 		sent++
 		if pace > 0 {
@@ -326,8 +377,8 @@ func runCase(sk *sink, host, viewer *rtc.Peer, w, h, frames int, dirty bool, pac
 	vs := viewer.Stats()
 
 	check(label+" 帧收齐", got == sent,
-		fmt.Sprintf("发送 %d / 重组解码 %d（缺失 %d）· 分片残缺 %d",
-			sent, got, sent-got, vs.FragLost))
+		fmt.Sprintf("发送 %d / 收到 %d 帧（缺失 %d）· 分块 %d · 坏块 %d",
+			sent, got, sent-got, vs.ChunksRecv, vs.BadChunks))
 
 	avgFrame := 0
 	if sent > 0 {
@@ -355,4 +406,113 @@ func runCase(sk *sink, host, viewer *rtc.Peer, w, h, frames int, dirty bool, pac
 	p := psnr(src, img, w, h)
 	check(label+" 画质", p >= 30,
 		fmt.Sprintf("PSNR %.2f dB（源 → 经网络 → 解码结果）", p))
+}
+
+// runLossRepair 验证"丢一个分块"的后果与修复代价 —— 这是本轮改动的核心命题。
+//
+// 旧实现：分块按帧重组，丢任意一块 = 整帧 2MB 作废，只能再要一整帧全量
+// （拥塞时那一发大概率又丢 → "越要越堵"）。
+// 新实现：每个分块自带帧头 + 完整条带，丢一块只丢它带的那几条带；
+// 修复走"渐进式轮转"，把补齐整屏摊到十几帧里，单帧始终很小。
+func runLossRepair(sk *sink, host *rtc.Peer) {
+	const (
+		w, h = 1920, 1080
+	)
+	src := makeFrame(w, h)
+	// 强制全量帧（Reset 后首帧必为全量），这样才能拿到"整屏"的条带集合。
+	enc := codec.NewEncoder(codec.Config{Quality: 75, Dirty: true})
+	full, err := enc.Encode(src, w, h)
+	if err != nil {
+		check("丢块恢复 编码", false, err.Error())
+		return
+	}
+	parts := full.Split(codec.MaxChunkPayload)
+	if len(parts) < 3 {
+		check("丢块恢复 分块", false, fmt.Sprintf("只切出 %d 块，无法做丢块实验", len(parts)))
+		return
+	}
+	// 丢掉中间那一块：它带的条带应当"精确地只有它那几条"。
+	dropIdx := len(parts) / 2
+	var dropMask uint64
+	for _, t := range parts[dropIdx].Tiles {
+		dropMask |= 1 << uint(t.Index)
+	}
+
+	sk.reset(w, h)
+	for i, c := range parts {
+		if i == dropIdx {
+			continue
+		}
+		wire, _ := c.Marshal()
+		for {
+			err := host.SendChunks([][]byte{wire})
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, rtc.ErrBackpressure) {
+				check("丢块恢复 发送", false, err.Error())
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	time.Sleep(400 * time.Millisecond)
+	_, _, _, _, _ = sk.snapshot()
+	// 等画布状态稳定下来再断言：异步批量解码是在独立 goroutine 上跑的，
+	// 固定 sleep 在高负载机器上会偶发地"还没解完就看结果"（实测遇到过一次）。
+	wantMissing := bits.OnesCount64(dropMask)
+	var complete, missing, tiles, have int
+	settleFrom := time.Now()
+	for i := 0; i < 60; i++ {
+		c, m, t, hv := sk.coverState()
+		complete, missing, tiles, have = boolToInt(c), m, t, hv
+		if m == wantMissing || time.Now().After(settleFrom.Add(3*time.Second)) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	check("丢块只丢它带的条带", complete == 0 && missing == wantMissing,
+		fmt.Sprintf("丢第 %d/%d 块（含 %d 条带）→ 画布 %d 条带里 %d 条内容有效、缺 %d（期望缺 %d）· 不完整=%v",
+			dropIdx+1, len(parts), wantMissing, tiles, have, missing, wantMissing, complete == 0))
+
+	// ---- 渐进式修复：摊到 10 帧，每帧都必须"小" ----
+	enc.BeginRepair(10)
+	repaired := false
+	repairFrames, repairBytes, maxRepairFrame := 0, 0, 0
+	for i := 0; i < 14; i++ {
+		out, err := enc.Encode(src, w, h)
+		if err != nil {
+			check("丢块恢复 修复编码", false, err.Error())
+			return
+		}
+		repairFrames++
+		repairBytes += out.Bytes
+		if out.Bytes > maxRepairFrame {
+			maxRepairFrame = out.Bytes
+		}
+		wire := [][]byte{}
+		for _, c := range out.Split(codec.MaxChunkPayload) {
+			b, err := c.Marshal()
+			if err != nil {
+				check("丢块恢复 修复序列化", false, err.Error())
+				return
+			}
+			wire = append(wire, b)
+		}
+		_ = host.SendChunks(wire)
+		time.Sleep(20 * time.Millisecond)
+		if c, _, _, _ := sk.coverState(); c {
+			repaired = true
+			break
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	done, missingNow, _, _ := sk.coverState()
+	check("渐进式修复铺满整屏", repaired && done && missingNow == 0,
+		fmt.Sprintf("用 %d 帧铺满（缺 %d 条带）· 单帧最大 %d KB（全量帧 %d KB 的 %d%%）",
+			repairFrames, missingNow, maxRepairFrame/1024, full.Bytes/1024,
+			maxRepairFrame*100/max(full.Bytes, 1)))
+	check("修复不产生大突发", maxRepairFrame*4 <= full.Bytes,
+		fmt.Sprintf("单帧最大 %d KB ≤ 全量帧的 1/4（%d KB）· 修复总流量 %d KB（全量帧 %d KB）",
+			maxRepairFrame/1024, full.Bytes/4096, repairBytes/1024, full.Bytes/1024))
 }

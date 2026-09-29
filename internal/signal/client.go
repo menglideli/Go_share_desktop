@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pion/webrtc/v4"
+	"goshare/internal/codec"
 )
 
 // Client 是观看端侧的信令客户端。
@@ -44,9 +45,16 @@ func (c *Client) Info(ctx context.Context) (Info, error) {
 // Join 提交 offer 并拿回 answer。成功表示握手完成，媒体面由调用方自行等待就绪。
 func (c *Client) Join(ctx context.Context, code, name string, offer webrtc.SessionDescription) (token string, answer webrtc.SessionDescription, hostName string, err error) {
 	var resp joinRespWire
-	err = c.do(ctx, http.MethodPost, "/api/join", joinReqWire{Code: code, Name: name, Offer: offer}, &resp)
+	err = c.do(ctx, http.MethodPost, "/api/join", joinReqWire{
+		Code: code, Name: name, Offer: offer, Proto: codec.ProtoVersion,
+	}, &resp)
 	if err != nil {
 		return "", webrtc.SessionDescription{}, "", err
+	}
+	// 版本握手（另一半）：老分享端不会带 Proto 字段 → 0。
+	// 必须在换 SDP 之前拦下来 —— 否则表现是"接入成功、画面全黑"。
+	if resp.Proto != codec.ProtoVersion {
+		return "", webrtc.SessionDescription{}, "", ErrProtoMismatch
 	}
 	return resp.Token, resp.Answer, resp.Name, nil
 }
@@ -113,6 +121,8 @@ func translateStatus(code int, raw []byte) error {
 		target = ErrRateLimited
 	case strings.Contains(msg, ErrFull.Error()):
 		target = ErrFull
+	case strings.Contains(msg, ErrProtoMismatch.Error()):
+		target = ErrProtoMismatch
 	}
 	if target != nil {
 		return fmt.Errorf("%w", target)
@@ -127,6 +137,8 @@ func translateStatus(code int, raw []byte) error {
 		return ErrRateLimited
 	case http.StatusServiceUnavailable:
 		return ErrFull
+	case http.StatusConflict:
+		return ErrProtoMismatch
 	}
 	return fmt.Errorf("服务端返回 %d", code)
 }

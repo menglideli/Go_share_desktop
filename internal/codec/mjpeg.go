@@ -16,10 +16,23 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"log"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// reportOversizedTile 对"降到地板还装不下"的条带记一笔（只打一次，避免刷屏）。
+var oversizedLogged atomic.Bool
+
+func reportOversizedTile(n int) {
+	if oversizedLogged.CompareAndSwap(false, true) {
+		log.Printf("codec: 有条带降到 q%d 仍超过单条带上限（%d > %d 字节）—— "+
+			"它会以超大消息发出；通常说明共享内容是高细节画面（照片/视频），可调小条带高度",
+			minTileQuality, n, maxSingleTilePayload)
+	}
+}
 
 // MCU 高：4:2:0 下为 16。条带高度必须对齐，否则相邻条带边界会互相串色。
 const mcuHeight = 16
@@ -61,20 +74,37 @@ type Tile struct {
 	Data  []byte
 }
 
-// Frame 是一帧编码结果。Tiles 只包含本帧真正编码的条带：
-// 未变化的条带不会出现在里面（观众端保留上一帧对应行即可）。
+// Frame 是一帧的编码结果。
+//
+// ⚠️ 一次 Marshal / Unmarshal 对应线路上**一个分块**，不是一个完整帧：
+// 2K 全量帧约 2MB，必须切成十几个分块才能发；每个分块自带完整帧头 + 若干**完整**
+// 条带记录（条带绝不跨块拆分），于是接收端收到一块就能解一块 —— 这是"丢一块只丢
+// 它带的条带"的前提（旧格式要求凑齐所有分块才能解析，丢任何一块 = 整帧 2MB 作废）。
+//
+// Tiles / Full / TilesMask 描述的都是**整个逻辑帧**：Tiles 只有本块携带的那些，
+// TilesMask 是本帧（跨全部块）包含哪些条带 —— 接收端据此知道该期待哪些条带，
+// 从而精确判定"哪些条带丢了"，而不是笼统地认为整帧丢了。
 type Frame struct {
-	Seq         uint64
-	W           int
-	H           int
-	TileH       int // 标准条带高度（最后一个条带可能更矮）
-	TotalTiles  int
-	Tiles       []Tile
-	Full        bool // true 表示全量帧（首帧 / 强制关键帧 / 变化过大）
-	TS          int64
-	EncodeMs    float64
-	Bytes       int
-	DirtyTiles  int
+	Seq        uint64
+	W          int
+	H          int
+	TileH      int // 标准条带高度（最后一个条带可能更矮）
+	TotalTiles int
+	Tiles      []Tile // 本**块**携带的条带（未变化的条带不出现）
+	Full       bool   // 整个逻辑帧是否包含全部条带（首帧 / 强制关键帧 / 变化过大）
+	// TilesMask 是逻辑帧的条带集合位图（bit i = 条带 i 在本帧内）。
+	// 每块里都写同一份 —— 这样任一块到达都能告诉接收端"还缺哪些"。
+	TilesMask uint64
+	// Refresh 是修复轮次：0 = 稳态；>0 表示分享端正在做渐进式修复（轮转发条带）。
+	// 接收端用它判断"修复在飞，别重复要全量"。
+	Refresh uint8
+	// ChunkIdx / ChunkTotal 是本块在帧内的序号与总块数（未被 Split 时 = 0/1）。
+	ChunkIdx   uint8
+	ChunkTotal uint8
+	TS         int64
+	EncodeMs   float64
+	Bytes      int
+	DirtyTiles int
 }
 
 // Encoder 把紧凑 BGRA 帧编码为 MJPEG 条带。非并发安全。
@@ -88,6 +118,12 @@ type Encoder struct {
 	havePrev bool
 	seq      uint64
 	i420Size int
+	// ---- 渐进式修复状态（见 BeginRepair）----
+	repairLeft  int   // 本轮还差多少条带没轮转
+	repairStep  int   // 每帧轮转多少条带
+	repairCur   int   // 轮转游标
+	repairEpoch uint8 // 当前轮次号（写进每帧的 Refresh 字段）
+	refresh     uint8 // 本帧要写出的轮次号（0 = 稳态）
 }
 
 // NewEncoder 创建编码器。初始尺寸未知，首次 Encode 时按帧尺寸初始化。
@@ -95,8 +131,56 @@ func NewEncoder(cfg Config) *Encoder {
 	return &Encoder{cfg: cfg.withDefaults()}
 }
 
+// BeginRepair 开始一轮**渐进式修复**：把"补齐整屏"分摊到 overFrames 帧里，
+// 每帧多带 1/overFrames 的条带（无论有没有变化）。
+//
+// 为什么不用一次性全量帧：全量帧是一发 2MB 的突发，在弱网/拥塞时大概率整发丢掉，
+// 而丢掉之后观众端只会再来要一次 —— "越要越堵、越堵越黑"的正反馈。
+// 摊成十几帧后单帧依然很小，拥塞时也发得出去；总流量与一发全量帧相同，
+// 只是用 0.3 秒铺开（30fps 下 overFrames=10）。
+//
+// overFrames <= 0 时按 10 帧算。已经在修复中时重复调用会被忽略（一轮跑完再说）。
+func (e *Encoder) BeginRepair(overFrames int) {
+	if e.nTiles == 0 || e.repairLeft > 0 {
+		return
+	}
+	if overFrames <= 0 {
+		overFrames = defaultRepairFrames
+	}
+	step := (e.nTiles + overFrames - 1) / overFrames
+	if step < 1 {
+		step = 1
+	}
+	e.repairStep = step
+	e.repairLeft = e.nTiles
+	e.repairCur = 0
+	e.repairEpoch++
+	if e.repairEpoch == 0 {
+		e.repairEpoch = 1 // 0 是"稳态"的保留值
+	}
+}
+
+// Repairing 报告当前是否有一轮修复在飞。
+func (e *Encoder) Repairing() bool { return e.repairLeft > 0 }
+
 // Config 返回生效配置。
 func (e *Encoder) Config() Config { return e.cfg }
+
+// SetQuality 热切换 JPEG 质量（自适应码率用）。
+//
+// 只在编码 goroutine 里调用（Encoder 非并发安全）。
+// 不需要强制全量帧：每个条带都是独立 JPEG，质量只影响后续编码的条带，
+// 观众端画布上的旧条带不受影响 —— 这恰恰是想要的：网络已经在堵了，
+// 不能再补一发全量帧火上浇油。
+func (e *Encoder) SetQuality(q int) {
+	if q < 1 {
+		q = 1
+	}
+	if q > 100 {
+		q = 100
+	}
+	e.cfg.Quality = q
+}
 
 // Size 返回当前编码尺寸。
 func (e *Encoder) Size() (w, h int) { return e.w, e.h }
@@ -123,6 +207,15 @@ func (e *Encoder) Reset(w, h int) {
 	}
 	e.tileH = tileH
 	e.nTiles = (h + tileH - 1) / tileH
+	// 条带集合用 uint64 位图描述（见 Frame.TilesMask），所以要限个数。
+	// 常规配置（Tiles = CPU 核数或 40）远达不到这个上限。
+	if e.nTiles > maxTiles {
+		e.tileH = ((h+maxTiles-1)/maxTiles + mcuHeight - 1) / mcuHeight * mcuHeight
+		if e.tileH < mcuHeight {
+			e.tileH = mcuHeight
+		}
+		e.nTiles = (h + e.tileH - 1) / e.tileH
+	}
 }
 
 // ForceKeyFrame 让下一帧编码为全量帧（新观众加入、重连时调用）。
@@ -154,6 +247,7 @@ func (e *Encoder) Encode(bgra []byte, w, h int) (*Frame, error) {
 		for i := range dirty {
 			dirty[i] = i
 		}
+		e.repairLeft = 0 // 整帧都发了，修复轮次没必要继续
 	} else {
 		dirty = dirtyTiles(e.i420, e.prev, w, h, e.tileH, e.nTiles)
 		// 变化面积极大时，增量已无意义（省不了带宽还多付了比较开销）→ 转全量
@@ -163,7 +257,19 @@ func (e *Encoder) Encode(bgra []byte, w, h int) (*Frame, error) {
 			for i := range dirty {
 				dirty[i] = i
 			}
+			e.repairLeft = 0
+		} else if e.repairLeft > 0 {
+			// 渐进式修复：本帧额外轮转 repairStep 个条带（不管它们有没有变化）。
+			dirty = e.addRepairTiles(dirty)
 		}
+	}
+	// TilesMask 描述的是**整个逻辑帧**（跨全部块），接收端据此判断丢了哪些条带。
+	var mask uint64
+	for _, idx := range dirty {
+		mask |= 1 << uint(idx)
+	}
+	if full {
+		mask = allTilesMask(e.nTiles)
 	}
 
 	img := I420Image(e.i420, w, h)
@@ -184,8 +290,25 @@ func (e *Encoder) Encode(bgra []byte, w, h int) (*Frame, error) {
 			defer func() { <-sem }()
 			sub := img.SubImage(image.Rect(0, y0, w, y1))
 			var buf bytes.Buffer
-			if err := jpeg.Encode(&buf, sub, &jpeg.Options{Quality: e.cfg.Quality}); err != nil {
-				return
+			// 单条带不会被拆开，所以它超了标称分块大小也只是"自己占一块更大的消息"。
+			// 这里只在它超过**硬上限**（1MB，正常永远到不了）时才降质重编 ——
+			// 曾经把阈值定在 60KB，结果 2K 高细节画面被降质，PSNR 直接掉 3.5dB。
+			q := e.cfg.Quality
+			for {
+				buf.Reset()
+				if err := jpeg.Encode(&buf, sub, &jpeg.Options{Quality: q}); err != nil {
+					break
+				}
+				if buf.Len() <= maxSingleTilePayload || q <= minTileQuality {
+					break
+				}
+				q -= 15
+				if q < minTileQuality {
+					q = minTileQuality
+				}
+			}
+			if buf.Len() > maxSingleTilePayload {
+				reportOversizedTile(buf.Len())
 			}
 			tiles[k] = Tile{Index: idx, Y0: y0, Y1: y1, Data: buf.Bytes()}
 		}(k, idx, y0, y1)
@@ -205,6 +328,12 @@ func (e *Encoder) Encode(bgra []byte, w, h int) (*Frame, error) {
 
 	e.havePrev = true
 	e.seq++
+	// 本帧要写出的修复轮次：修复还在飞就带上轮次号，跑完自动回 0（稳态）。
+	if e.repairLeft > 0 {
+		e.refresh = e.repairEpoch
+	} else {
+		e.refresh = 0
+	}
 	return &Frame{
 		Seq:        e.seq,
 		W:          w,
@@ -213,11 +342,47 @@ func (e *Encoder) Encode(bgra []byte, w, h int) (*Frame, error) {
 		TotalTiles: e.nTiles,
 		Tiles:      out,
 		Full:       full,
+		TilesMask:  mask,
+		Refresh:    e.refresh,
+		ChunkIdx:   0,
+		ChunkTotal: 1,
 		TS:         time.Now().UnixMilli(),
 		EncodeMs:   float64(time.Since(t0).Microseconds()) / 1000.0,
 		Bytes:      total,
 		DirtyTiles: len(out),
 	}, nil
+}
+
+// addRepairTiles 把本轮修复的下 repairStep 个条带并进 dirty（去重）。
+// 条带按游标轮转，一轮走完全部条带 —— 观众端画布因此在 ~overFrames 帧内铺满。
+func (e *Encoder) addRepairTiles(dirty []int) []int {
+	if e.nTiles <= 0 {
+		return dirty
+	}
+	seen := make(map[int]struct{}, len(dirty))
+	for _, idx := range dirty {
+		seen[idx] = struct{}{}
+	}
+	for i := 0; i < e.repairStep && e.repairLeft > 0; i++ {
+		idx := e.repairCur % e.nTiles
+		e.repairCur++
+		e.repairLeft--
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		dirty = append(dirty, idx)
+	}
+	return dirty
+}
+
+// allTilesMask 返回 nTiles 个条带全在的位图（nTiles 上限见 maxTiles。
+// 超出 64 个条带时退化为"最高位全 1"，接收端只会更保守）。
+func allTilesMask(nTiles int) uint64 {
+	if nTiles >= 64 {
+		return ^uint64(0)
+	}
+	return 1<<uint(nTiles) - 1
 }
 
 // dirtyTiles 逐条带比较 I420，返回有变化的条带下标。
@@ -265,37 +430,75 @@ func tileChanged(cur, prev []byte, w, h, y0, y1 int) bool {
 }
 
 // ---------------------------------------------------------------------------
+// 协议版本
+// ---------------------------------------------------------------------------
+
+// ProtoVersion 是**媒体线格式**的版本号。任何改变线格式的改动都要 +1。
+//
+// 为什么必须有它：线格式变了以后，新旧混用不会报错，而是"对接上了但画面全黑"
+// （旧端按老格式解析新分块，得到的长度/序号是乱的，静默丢弃）。
+// 所以两端在 HTTP 接入阶段就互报版本，不一致时给一句人能看懂的话：
+// 「双方版本不一致，请把两台机器都升级到同一版本」。
+//
+// 历史：1 = GSJ1（整帧一个消息、按字节切块）；2 = GSJ2（每块自带帧头 + 完整条带）。
+const ProtoVersion = 2
+
+// ---------------------------------------------------------------------------
 // Wire 格式
 // ---------------------------------------------------------------------------
 //
-// 帧 = 28 字节头 + N 个条带记录。
-// 采用定长头 + 变长条带，接收端一次解析即可，无需流式状态机。
+// ⚠️ 线路上**一个消息 = 一个分块**，不是一个完整帧（2K 全量约 2MB，必须切块发）。
+// 每个分块自带完整帧头 + 若干**完整**条带记录，条带绝不跨块拆分 ——
+// 于是接收端收到一块就能解一块：丢一块只丢它带的那几条带，而不是整帧作废。
+// （旧格式 GCJ1 是"整帧一个消息、按字节切块"，丢任意一块整帧都解析不出来。）
 //
-//	0  .. 3  magic "GSJ1"
+//	0  .. 3  magic "GSJ2"
 //	4  .. 11 seq        uint64 BE
 //	12 .. 15 ts         uint32 BE（Unix 毫秒低 32 位，仅用于延迟统计）
 //	16 .. 17 width      uint16 BE
 //	18 .. 19 height     uint16 BE
 //	20 .. 21 totalTiles uint16 BE
 //	22 .. 23 tileH      uint16 BE
-//	24       flags      bit0 = 全量帧
-//	25 .. 27 reserved
-//	此后每条带：
+//	24       flags      bit0 = 整个逻辑帧含全部条带
+//	25       refresh    修复轮次（0 = 稳态）
+//	26       chunkIdx   本块序号
+//	27       chunkTotal 本帧总块数
+//	28 .. 35 tilesMask  uint64 BE：整个逻辑帧包含哪些条带（每块都写同一份，
+//	                    接收端据此精确知道"该期待哪些条带、丢了哪几条"）
+//	此后每条带（永不跨块拆分）：
 //	   0 .. 1  index    uint16 BE
 //	   2 .. 3  y0       uint16 BE
 //	   4 .. 7  dataLen  uint32 BE
 //	   8 ..    JPEG 数据
 
 const (
-	frameHeaderLen = 28
+	frameHeaderLen = 36
 	tileHeaderLen  = 8
 	flagFull       = 1 << 0
+	// maxTiles 是条带数上限：条带集合用 uint64 位图描述（见 Frame.TilesMask）。
+	maxTiles = 64
+	// MaxChunkPayload 是分块的**标称**字节上限（尽量不超过）。
+	// rtc 的切块用它 —— 但注意：单个条带永远不会被拆开（拆了接收端就要为它
+	// 保留重组状态，等于把刚拆掉的那套复杂度请回来），所以当一个条带本身就比
+	// 标称值大时，它会**单独成块发一条更大的消息**。
+	// 实测（out/msgsize 探针）：pion↔pion 的 DataChannel 512KB 消息照样送达，
+	// 标称 60KB 只是"保持丢失粒度细"的偏好，不是硬上限。
+	MaxChunkPayload = 60 << 10
+	// maxSingleTilePayload 是单条带的硬上限，超过才降质重编（安全阀，不该触发）。
+	// 2K 一条带正常 10~40KB，高细节画面也就一两百 KB。
+	maxSingleTilePayload = 1 << 20
+	// minTileQuality 是"为了塞进硬上限而降质重编"的地板。
+	minTileQuality = 30
+	// defaultRepairFrames 是渐进式修复默认摊到多少帧（见 Encoder.BeginRepair）。
+	defaultRepairFrames = 10
 )
 
-var frameMagic = [4]byte{'G', 'S', 'J', '1'}
+var frameMagic = [4]byte{'G', 'S', 'J', '2'}
 
-// Marshal 序列化为线格式。巨帧（2K 高质量）可能上百 KB，
-// 发送端需按 MaxMessageSize 分片（见 internal/net）。
+// Marshal 把**一个分块**序列化为线格式（见上面的格式说明）。
+//
+// 若这帧尚未 Split，则整帧就是一个分块（chunkTotal=1），用于测试与小帧。
+// 发送端按消息大小上限切片（见 internal/rtc 的 chunkPayload）。
 func (f *Frame) Marshal() ([]byte, error) {
 	if f.W > 65535 || f.H > 65535 {
 		return nil, errors.New("codec: 尺寸超出线格式上限")
@@ -315,6 +518,13 @@ func (f *Frame) Marshal() ([]byte, error) {
 	if f.Full {
 		buf[24] = flagFull
 	}
+	buf[25] = f.Refresh
+	buf[26] = f.ChunkIdx
+	buf[27] = f.ChunkTotal
+	if buf[27] == 0 {
+		buf[27] = 1 // 未 Split 的单块帧
+	}
+	binary.BigEndian.PutUint64(buf[28:36], f.TilesMask)
 	off := frameHeaderLen
 	for _, t := range f.Tiles {
 		binary.BigEndian.PutUint16(buf[off:off+2], uint16(t.Index))
@@ -327,13 +537,66 @@ func (f *Frame) Marshal() ([]byte, error) {
 	return buf, nil
 }
 
-// UnmarshalFrame 解析线格式帧。
+// Split 把整帧切成若干个**可独立解析**的分块（每块自带帧头 + 完整条带记录）。
+//
+// maxPayload 是标称的单块字节上限。条带**不会**被拆开：一个条带本身就超过标称值时，
+// 它单独成一块（消息更大，但接收端照样独立解析 —— 实测 pion↔pion 512KB 消息可达）。
+func (f *Frame) Split(maxPayload int) []*Frame {
+	if len(f.Tiles) == 0 || maxPayload <= frameHeaderLen {
+		f.ChunkIdx, f.ChunkTotal = 0, 1
+		return []*Frame{f}
+	}
+	budget := maxPayload - frameHeaderLen
+	var chunks []*Frame
+	cur := &Frame{}
+	curSize := 0
+	flush := func() {
+		if cur == nil || len(cur.Tiles) == 0 {
+			return
+		}
+		chunks = append(chunks, cur)
+		cur = &Frame{}
+		curSize = 0
+	}
+	for _, t := range f.Tiles {
+		need := tileHeaderLen + len(t.Data)
+		if len(cur.Tiles) > 0 && curSize+need > budget {
+			flush()
+		}
+		if cur.Tiles == nil {
+			// 每块都要带完整帧头（接收端靠它独立解析）。
+			*cur = Frame{
+				Seq: f.Seq, W: f.W, H: f.H, TileH: f.TileH, TotalTiles: f.TotalTiles,
+				Full: f.Full, TilesMask: f.TilesMask, Refresh: f.Refresh,
+				TS: f.TS, EncodeMs: f.EncodeMs,
+			}
+		}
+		cur.Tiles = append(cur.Tiles, t)
+		cur.Bytes += len(t.Data)
+		curSize += need
+	}
+	flush()
+	total := len(chunks)
+	if total > 255 {
+		// 理论上到不了（单帧最大 64 条带、单块 60KB）；真到了就退化成一块超大消息，
+		// 让上层按消息发送，别静默丢内容。
+		total = 255
+	}
+	for i, c := range chunks {
+		c.ChunkIdx = uint8(i)
+		c.ChunkTotal = uint8(total)
+		c.DirtyTiles = len(c.Tiles)
+	}
+	return chunks
+}
+
+// UnmarshalFrame 解析**一个分块**（自带帧头，无需与其他块拼接）。
 func UnmarshalFrame(buf []byte) (*Frame, error) {
 	if len(buf) < frameHeaderLen {
-		return nil, errors.New("codec: 帧过短")
+		return nil, errors.New("codec: 分块过短")
 	}
 	if !bytes.Equal(buf[0:4], frameMagic[:]) {
-		return nil, errors.New("codec: 帧魔数不匹配")
+		return nil, errors.New("codec: 魔数不匹配（对方可能是旧版本，两个端都要升级）")
 	}
 	f := &Frame{
 		Seq:        binary.BigEndian.Uint64(buf[4:12]),
@@ -344,6 +607,13 @@ func UnmarshalFrame(buf []byte) (*Frame, error) {
 		TileH:      int(binary.BigEndian.Uint16(buf[22:24])),
 	}
 	f.Full = buf[24]&flagFull != 0
+	f.Refresh = buf[25]
+	f.ChunkIdx = buf[26]
+	f.ChunkTotal = buf[27]
+	if f.ChunkTotal == 0 {
+		f.ChunkTotal = 1
+	}
+	f.TilesMask = binary.BigEndian.Uint64(buf[28:36])
 	off := frameHeaderLen
 	for off+tileHeaderLen <= len(buf) {
 		idx := int(binary.BigEndian.Uint16(buf[off : off+2]))
@@ -380,6 +650,14 @@ type Decoder struct {
 	seq     uint64
 	// DecodeMs 是最近一帧的解码耗时（诊断用）。
 	DecodeMs float64
+
+	// ---- 分块级接收的画布完整性（见 Decode 与 Complete）----
+	tileCount int    // 条带总数（画布尺寸变化时重置）
+	have      uint64 // 画布上是"当前内容"的条带位图
+	curSeq    uint64 // 正在收集的那一帧
+	curExpect uint64 // 该帧应到（TilesMask）
+	curGot    uint64 // 该帧实到
+	maxSeq    uint64 // 已见过的最大 seq（乱序保护）
 }
 
 // NewDecoder 创建解码器。workers<=0 时取 NumCPU。
@@ -396,24 +674,108 @@ func (d *Decoder) Image() *image.NRGBA { return d.img }
 // Seq 返回最近解出的帧序号。
 func (d *Decoder) Seq() uint64 { return d.seq }
 
-// Decode 解码一帧到画布。分辨率变化时自动重建画布（MJPEG 天然支持，
-// 不需要像 H.264 那样重配解码器 —— 这是选 MJPEG 的收益之一）。
+// reorderWindow 是"乱序容忍窗口"（帧）。
+//
+// 媒体通道是无序的：晚了几个帧的分块再到达时，如果照解就会把**新画面盖回旧内容**。
+// 超过这个窗口的分块一律丢弃 —— 局域网内跨 3 帧乱序基本不存在，
+// 而少了这道闸，丢帧时的花屏会变成"新旧交替闪烁"，很难查。
+const reorderWindow = 4
+
+// Complete 报告画布是否"每个条带都是当前内容"。
+//
+// 判据是我们自己维护的 have 位图（不是"收到过全量帧"）：
+//   - 解出条带 → 置位；
+//   - 一帧收尾时，**该到而没到的条带**（TilesMask 里有、实际没收到）→ 清位，
+//     它们的内容已经过期（分块丢了就是丢了，增量帧不会重发）。
+//
+// 这是"卡顿黑屏"的判定入口：不完整就请对端做一轮渐进式修复。
+func (d *Decoder) Complete() bool {
+	if d.tileCount <= 0 {
+		return false
+	}
+	return d.have == allTilesMask(d.tileCount)
+}
+
+// Missing 返回"内容已过期的条带"位图（诊断用）。
+func (d *Decoder) Missing() uint64 {
+	if d.tileCount <= 0 {
+		return 0
+	}
+	return allTilesMask(d.tileCount) &^ d.have
+}
+
+// Have 返回"内容是当前值"的条带位图（诊断/统计用）。
+func (d *Decoder) Have() uint64 { return d.have }
+
+// TileCount 返回当前画布的条带总数。
+func (d *Decoder) TileCount() int { return d.tileCount }
+
+// Decode 把一个**分块**解到画布上（一个分块可能只带少数几个条带）。
+// 分辨率变化时自动重建画布（MJPEG 天然支持，不需要像 H.264 那样重配解码器）。
+//
+// ⚠️ 语义与旧版不同：以前传进来的是"整帧"（必须凑齐所有分块才解析得出来），
+// 现在是一个分块。丢一块只丢它带的那几条带，其余照常上屏。
 func (d *Decoder) Decode(f *Frame) (*image.NRGBA, error) {
-	if f == nil || f.W <= 0 || f.H <= 0 {
-		return nil, errors.New("codec: 无效帧")
+	return d.DecodeBatch([]*Frame{f})
+}
+
+// DecodeBatch 把若干分块（可以来自不同帧）一次解进画布。
+//
+// 为什么需要"批量"：单块通常只带 1~2 个条带，而 JPEG 解码是 CPU 大头
+// （2K 一条带 ~3ms）。逐块串行解 = 把帧内的并行度全丢掉 —— 实测 2K 全量从
+// 7ms 涨到 98ms。攒一批一起解，就能把所有条带铺到一个并行池上跑。
+func (d *Decoder) DecodeBatch(frames []*Frame) (*image.NRGBA, error) {
+	if len(frames) == 0 {
+		return d.img, nil
 	}
 	t0 := time.Now()
-	if d.img == nil || d.w != f.W || d.h != f.H {
-		d.img = image.NewNRGBA(image.Rect(0, 0, f.W, f.H))
-		d.w, d.h = f.W, f.H
-		d.seq = 0
-	}
-	dst := d.img.Pix
-	stride := f.W * 4
 
+	// ---- 1) 先按顺序处理"帧边界 / 乱序 / 尺寸变化"这类状态 ----
+	var jobs []Tile
+	for _, f := range frames {
+		if f == nil || f.W <= 0 || f.H <= 0 {
+			continue
+		}
+		if d.img == nil || d.w != f.W || d.h != f.H {
+			d.img = image.NewNRGBA(image.Rect(0, 0, f.W, f.H))
+			d.w, d.h = f.W, f.H
+			d.seq = 0
+			// 画布尺寸变了 = 全新一代画布：完整性位图与乱序窗口全部重来。
+			d.tileCount = f.TotalTiles
+			d.have = 0
+			d.curSeq, d.curExpect, d.curGot, d.maxSeq = 0, 0, 0, 0
+		}
+		if f.TotalTiles > d.tileCount {
+			d.tileCount = f.TotalTiles
+		}
+		// 一帧收尾：上一帧"该到没到"的条带内容已过期 → 清位（修复会补）。
+		if f.Seq != d.curSeq {
+			d.have &^= d.curExpect &^ d.curGot
+			d.curSeq, d.curExpect, d.curGot = f.Seq, 0, 0
+		}
+		// 乱序保护：太旧的分块直接丢（否则旧内容会盖掉新画面）。
+		if d.maxSeq > reorderWindow && f.Seq+reorderWindow < d.maxSeq {
+			continue
+		}
+		if f.Seq > d.maxSeq {
+			d.maxSeq = f.Seq
+		}
+		d.curExpect |= f.TilesMask
+		d.seq = f.Seq
+		jobs = append(jobs, f.Tiles...)
+	}
+	if len(jobs) == 0 {
+		d.DecodeMs = float64(time.Since(t0).Microseconds()) / 1000.0
+		return d.img, nil
+	}
+
+	// ---- 2) 并行解码 + 写画布（条带互不重叠，可以放心并行）----
+	dst := d.img.Pix
+	stride := d.w * 4
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, d.workers)
-	for _, t := range f.Tiles {
+	var mu sync.Mutex
+	for _, t := range jobs {
 		wg.Add(1)
 		go func(t Tile) {
 			defer wg.Done()
@@ -424,10 +786,13 @@ func (d *Decoder) Decode(f *Frame) (*image.NRGBA, error) {
 				return
 			}
 			writeTile(dst, stride, img, t.Y0, t.Y1, d.workers)
+			mu.Lock()
+			d.have |= 1 << uint(t.Index)
+			d.curGot |= 1 << uint(t.Index)
+			mu.Unlock()
 		}(t)
 	}
 	wg.Wait()
-	d.seq = f.Seq
 	d.DecodeMs = float64(time.Since(t0).Microseconds()) / 1000.0
 	return d.img, nil
 }

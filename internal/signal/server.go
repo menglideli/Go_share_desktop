@@ -19,6 +19,8 @@ import (
 	"sync"
 	"time"
 
+	"goshare/internal/codec"
+
 	"github.com/pion/webrtc/v4"
 	"goshare/internal/netif"
 )
@@ -40,6 +42,8 @@ var (
 	ErrRateLimited = errors.New("signal: 尝试过于频繁，请稍后再试")
 	// ErrFull 观众数已达上限。
 	ErrFull = errors.New("signal: 观看人数已满")
+	// ErrProtoMismatch 两端媒体线格式版本不一致。
+	ErrProtoMismatch = errors.New("signal: 双方版本不一致，请把两台机器都升级到同一版本后重试")
 )
 
 // Info 是分享端对外公布的会话信息（未接入前可匿名获取，方便排障）。
@@ -335,12 +339,17 @@ type joinReqWire struct {
 	Code  string                    `json:"code"`
 	Name  string                    `json:"name"`
 	Offer webrtc.SessionDescription `json:"offer"`
+	// Proto 是媒体线格式版本（见 codec.ProtoVersion）。
+	// 老版本客户端不带这个字段 → 0 → 直接拒掉，而不是让它黑屏。
+	Proto int `json:"proto"`
 }
 
 type joinRespWire struct {
 	Token  string                    `json:"token"`
 	Answer webrtc.SessionDescription `json:"answer"`
 	Name   string                    `json:"hostName"`
+	// Proto 是本端（分享端）的线格式版本，供观众端比对。
+	Proto int `json:"proto"`
 }
 
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
@@ -366,6 +375,12 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	if !CodeEqual(jr.Code, s.Code()) {
 		s.noteFail(ip)
 		writeErr(w, http.StatusUnauthorized, ErrBadCode.Error())
+		return
+	}
+	// 版本握手：媒体线格式不兼容时在这里就说清楚。
+	// 不做这一步的表现是"接入成功、画面全黑"，用户完全无法判断该做什么。
+	if jr.Proto != codec.ProtoVersion {
+		writeErr(w, http.StatusConflict, ErrProtoMismatch.Error())
 		return
 	}
 	s.mu.Lock()
@@ -414,7 +429,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		if closeFn != nil {
 			closeFn()
 		}
-		writeJSON(w, http.StatusOK, joinRespWire{Token: tok, Answer: answer, Name: s.cfg.Name})
+		writeJSON(w, http.StatusOK, joinRespWire{Token: tok, Answer: answer, Name: s.cfg.Name, Proto: codec.ProtoVersion})
 		return
 	}
 	v.closeFn = closeFn
@@ -424,7 +439,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.Logger != nil {
 		s.cfg.Logger.Printf("观众接入 %s（%s），当前 %d 人", jr.Name, ip, total)
 	}
-	writeJSON(w, http.StatusOK, joinRespWire{Token: tok, Answer: answer, Name: s.cfg.Name})
+	writeJSON(w, http.StatusOK, joinRespWire{Token: tok, Answer: answer, Name: s.cfg.Name, Proto: codec.ProtoVersion})
 }
 
 func (s *Server) handleBye(w http.ResponseWriter, r *http.Request) {

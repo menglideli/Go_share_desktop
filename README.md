@@ -82,7 +82,7 @@ netsh advfirewall firewall add rule name="GoShare-Discovery" dir=in action=allow
 | `-display N` | 采集第 N 台显示器（默认主屏） |
 | `-log 文件` | 日志写到文件（windowsgui 构建无控制台，排障时必加） |
 | `-auto share / watch` | 无人值守模式（配合 `-addr` / `-code-watch`，供自动化验证） |
-| `-key-interval 30s` | 周期性全量帧间隔（0 = 只靠观众请求恢复） |
+| `-key-interval 30s` | 周期性地开一轮"渐进式修复"的间隔（0 = 只靠观众端请求恢复） |
 
 ## 从源码构建
 

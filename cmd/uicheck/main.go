@@ -78,6 +78,14 @@ func main() {
 			check(c.name, false, "渲染失败: "+err.Error())
 			continue
 		}
+		// HUD 是 320×46 dp 的小条：整画布统计会淹在黑背景里，
+		// 裁出条体再统计/存档 —— 基线就是条本身。
+		// ⚠️ 尺寸必须与**真实窗口**一致（320×46 dp × 当前缩放），
+		// 之前固定按 340×56 裁，与真实窗口对不上，等于基线盯的不是同一个东西。
+		if hc, ok := hudCases[c.name]; ok {
+			p := hudPixelSize(hc.scale)
+			img = cropCenter(img, p.X, p.Y)
+		}
 		path := filepath.Join(*outDir, "ui-"+c.name+".png")
 		if err := savePNG(path, img); err != nil {
 			check(c.name, false, "保存失败: "+err.Error())
@@ -87,6 +95,19 @@ func main() {
 		// 判据一：非黑占比必须够高（版面确实画了东西），且主色不能是纯背景。
 		ok := st.nonBlack > 0.02 && st.distinct > 8
 		detail := fmt.Sprintf("非黑 %.1f%% · 不同色 %d 种 · 亮部 %.1f%%", st.nonBlack*100, st.distinct, st.bright*100)
+
+		// 判据一补充（悬浮条专用）：内容必须完整落在条体内。
+		// 悬浮条的「停止」按钮是唯一的大块纯红，用它当"内容有没有被裁"的探针：
+		// 按钮贴着/越过窗口边界就说明布局溢出（窗口比内容窄时会直接看不到按钮）。
+		if hc, isHUD := hudCases[c.name]; isHUD {
+			sz := hudPixelSize(hc.scale)
+			btn, n := redBounds(img)
+			fits := n > 0 && btn.Min.X >= 2 && btn.Min.Y >= 2 && btn.Max.X <= sz.X-2 && btn.Max.Y <= sz.Y-2
+			if !fits {
+				ok = false
+			}
+			detail += fmt.Sprintf(" · 停止按钮 %v（%d px）完整可见=%v", btn, n, fits)
+		}
 
 		// 判据二（R31）：与基线图逐像素比对。
 		// 判据一太粗 —— R30 那种"按钮整列消失"只改动 2~4% 的像素，
@@ -123,6 +144,20 @@ func main() {
 	if fail > 0 {
 		os.Exit(1)
 	}
+}
+
+// cropCenter 裁出居中的 w×h 区域（HUD 这类小组件的基线只需要组件本身）。
+func cropCenter(img *image.RGBA, w, h int) *image.RGBA {
+	b := img.Bounds()
+	x0 := b.Min.X + (b.Dx()-w)/2
+	y0 := b.Min.Y + (b.Dy()-h)/2
+	r := image.Rect(x0, y0, x0+w, y0+h).Intersect(b)
+	out := image.NewRGBA(image.Rect(0, 0, r.Dx(), r.Dy()))
+	for y := 0; y < r.Dy(); y++ {
+		copy(out.Pix[y*out.Stride:(y+1)*out.Stride],
+			img.Pix[(r.Min.Y+y)*img.Stride+r.Min.X*4:(r.Min.Y+y)*img.Stride+r.Max.X*4])
+	}
+	return out
 }
 
 // diffResult 是两张图的像素差异。
@@ -253,11 +288,88 @@ func cases() []testCase {
 			s.SetDragPreview(image.Pt(760, 150), image.Pt(1080, 420))
 			s.SetRegionRect(capture.Rect{X: 613, Y: 121, W: 640, H: 511})
 		}},
+		// 分享中置顶悬浮条（独立窗口，渲染路径见 render 的特判）
+		{name: "hud", setup: nil},
+		// 同一根条在 175% 缩放下的样子：真实机器就是 175%，高 DPI 下的裁切
+		// 只有这一条能盯住（dp 布局相同、像素不同，出问题的方式也不同）。
+		{name: "hud-175", setup: nil},
 	}
+}
+
+// hudCases 是悬浮条的离屏渲染用例：用例名 → 缩放。
+//
+// ⚠️ 尺寸必须与**真实窗口**一致：真实窗口是 app.Size(Dp(320), Dp(46))，
+// 175% 缩放下即 560×80 物理像素。旧基线按 340×56 渲染（两个数都对不上），
+// 等于"验过的"和"用户看到的"不是同一个东西。
+var hudCases = map[string]struct{ scale float32 }{
+	"hud":     {scale: 1},
+	"hud-175": {scale: 1.75},
+}
+
+// hudPixelSize 返回悬浮条在给定缩放下的物理像素尺寸（320×46 dp）。
+func hudPixelSize(scale float32) image.Point {
+	return image.Pt(int(320*scale+0.5), int(46*scale+0.5))
+}
+
+// redBounds 找「停止」按钮的纯红区块（colBad = 224,82,82，不透明），
+// 返回包围盒与像素数 —— 用来断言"按钮没有被窗口裁掉"。
+func redBounds(img *image.RGBA) (image.Rectangle, int) {
+	const tol = 12
+	b := img.Bounds()
+	var box image.Rectangle
+	n := 0
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			i := y*img.Stride + x*4
+			if absi(int(img.Pix[i])-224) < tol &&
+				absi(int(img.Pix[i+1])-82) < tol &&
+				absi(int(img.Pix[i+2])-82) < tol {
+				n++
+				r := image.Rect(x, y, x+1, y+1)
+				if n == 1 {
+					box = r
+				} else {
+					box = box.Union(r)
+				}
+			}
+		}
+	}
+	return box, n
 }
 
 // render 把某个页面离屏渲染成 RGBA 图。
 func render(win *headless.Window, th *material.Theme, w, h int, name string, setup func(*ui.Shell)) (*image.RGBA, error) {
+	var ops op.Ops
+	r := new(input.Router)
+	gtx := layout.Context{
+		Ops:         &ops,
+		Metric:      unit.Metric{PxPerDp: 1, PxPerSp: 1},
+		Constraints: layout.Exact(image.Pt(w, h)),
+		Now:         time.Now(),
+		Source:      r.Source(),
+	}
+
+	// HUD 不进主壳路由（它是独立置顶窗口），单独走一条渲染路径：
+	// 按真实窗口尺寸（320×46 dp）与真实缩放渲染，避免被整窗约束拉变形。
+	if hc, ok := hudCases[name]; ok {
+		gtx.Metric = unit.Metric{PxPerDp: hc.scale, PxPerSp: hc.scale}
+		bar := ui.NewHUD(ui.HUDConfig{Title: "uicheck-hud"})
+		bar.SetState(3, "最大·q59", false)
+		layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			gtx.Constraints = layout.Exact(hudPixelSize(hc.scale))
+			return bar.Layout(gtx, th)
+		})
+		r.Frame(&ops)
+		if err := win.Frame(&ops); err != nil {
+			return nil, err
+		}
+		img := image.NewRGBA(image.Rect(0, 0, w, h))
+		if err := win.Screenshot(img); err != nil {
+			return nil, err
+		}
+		return img, nil
+	}
+
 	s := ui.NewShell(ui.ShellConfig{
 		Title:    "uicheck",
 		Displays: fakeDisplays(),
@@ -268,15 +380,6 @@ func render(win *headless.Window, th *material.Theme, w, h int, name string, set
 	}
 	s.Go(routeOf(name))
 
-	var ops op.Ops
-	r := new(input.Router)
-	gtx := layout.Context{
-		Ops:         &ops,
-		Metric:      unit.Metric{PxPerDp: 1, PxPerSp: 1},
-		Constraints: layout.Exact(image.Pt(w, h)),
-		Now:         time.Now(),
-		Source:      r.Source(),
-	}
 	s.Layout(gtx, th)
 	r.Frame(&ops)
 

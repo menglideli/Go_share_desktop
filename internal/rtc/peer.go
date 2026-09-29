@@ -1,33 +1,60 @@
 // Package rtc 封装 pion/webrtc，提供屏幕共享所需的两个通道：
 //
-//	media —— 不可靠、无序（MaxRetransmits=0）：传帧数据。丢一片就丢这一帧的对应区域，
-//	         绝不重传阻塞；MJPEG 每帧独立，下一帧会自然补上。
-//	ctl   —— 可靠、有序：传控制消息（请求关键帧、分辨率通知、统计）。
+//	media —— 不可靠、无序（MaxRetransmits=0）：传画面分块。每个线路消息就是一个
+//	         **可独立解析的分块**（自带帧头 + 完整条带，见 codec 的线格式说明），
+//	         所以丢一块只丢它带的那几条带 —— 不重传、不阻塞、不等重传。
+//	ctl   —— 可靠、有序：传控制消息（请求修复、统计等）。
 //
-// 为什么不用一条可靠通道：可靠 + 有序在丢包时会让后续帧全部排队等重传，
-// 延迟瞬间飙到数百毫秒 —— 这正是要避免的。代价是丢失的条带要靠 PLI 补。
+// 为什么不用一条可靠通道：可靠 + 有序在丢包时会让后续数据全部排队等重传，
+// 延迟瞬间飙到数百毫秒 —— 这正是要避免的。代价是丢的那几条带要靠修复轮次补
+// （分享端把补齐整屏摊到十几帧里，而不是发一发 2MB 的全量帧）。
+//
+// ⚠️ 这里**没有重组层**：旧实现要求把同一帧的所有分块凑齐才能解析，
+// 于是丢任意一块 = 整帧 2MB 作废（2K 一帧 35 块），观众只能再要一整帧全量 ——
+// 拥塞时"越要越堵"。现在收到一块解一块，丢一块只影响它自己那几条带。
 package rtc
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
 	"goshare/internal/codec"
 )
 
-// 分片大小。阶段 0 实测单条 64KB 消息可行，但那是上限边界，
-// 留出余量用 60KB，避免触碰 SCTP 消息大小限制。
+// 分块大小上限。分块的**切法**由 codec.Frame.Split 决定（保证条带不跨块），
+// 这里只是取同一个常量，避免两处各写一个数字。
+const chunkPayload = codec.MaxChunkPayload
+
+// 背压阈值：媒体通道积压超过它（按当前帧大小算出来，见 SendLimit）就丢弃这一帧，
+// 防止弱网观众把自己拖死。
+//
+// ⚠️ 这里曾经是固定 8MB。8MB ≈ 4 个 2K 全量帧 —— 等于允许落后 4 帧才丢，
+// 而这个通道是"不可靠+无序"的：积压的字节要等 SCTP 发完才轮到新帧，
+// 光是这个阈值就自带几百毫秒延迟（用户感受就是"卡的时候延迟很长"）。
+// 现在按帧大小自适应，目标只有"约一帧半"。
 const (
-	chunkPayload   = 60 * 1024
-	chunkHeaderLen = 8
-	// 背压阈值：媒体通道积压超过它就丢弃这一帧，防止弱网观众把自己拖死。
-	// 30fps × 2K 全量约 2MB/帧，积压 8MB ≈ 落后 4 帧，已经没有追赶价值。
-	maxBuffered = 8 << 20
+	minBuffered = 512 << 10
+	maxBuffered = 4 << 20
 )
+
+// SendLimit 返回"当前允许积压多少字节"，按这一帧的大小自适应。
+//
+// 语义：超过它就整帧丢弃（下一帧顶上）。丢一帧的代价是那几块条带暂时没更新，
+// 而拖着的代价是**整条流都变慢**——两害相权取其轻。
+func SendLimit(frameBytes int) uint64 {
+	lim := uint64(frameBytes) * 3 / 2
+	if lim < minBuffered {
+		lim = minBuffered
+	}
+	if lim > maxBuffered {
+		lim = maxBuffered
+	}
+	return lim
+}
 
 // ErrBackpressure 表示发送缓冲积压过多，该帧被主动丢弃。
 var ErrBackpressure = errors.New("rtc: 发送缓冲积压，丢弃该帧")
@@ -37,13 +64,19 @@ var ErrNotOpen = errors.New("rtc: 数据通道未打开")
 
 // Stats 是传输侧统计。
 type Stats struct {
-	FramesSent   uint64
-	FramesRecv   uint64
-	FramesDrop   uint64 // 因背压丢弃
-	FragLost     uint64 // 分片不完整被丢弃的帧
-	BytesSent    uint64
-	BytesRecv    uint64
-	Buffered     uint64
+	FramesSent uint64
+	FramesRecv uint64
+	FramesDrop uint64 // 发送侧因背压丢弃
+	ChunksSent uint64
+	ChunksRecv uint64
+	ChunksSkip uint64 // 接收侧因解码跟不上丢弃的分块（AsyncFrames）
+	// BadChunks 是解析失败的分块（魔数不对 / 长度越界）。
+	// ⚠️ 它**不再**表示"分块丢了"：现在丢一块只会让观众端少几条带，
+	// 由 codec.Decoder 的完整性位图判定（见 Decoder.Complete）。
+	BadChunks uint64
+	BytesSent uint64
+	BytesRecv uint64
+	Buffered  uint64
 }
 
 // Config 创建 Peer 的参数。
@@ -64,19 +97,49 @@ type Config struct {
 	// 都为 0 表示用 pion 默认（49152~65535）。
 	UDPPortMin uint16
 	UDPPortMax uint16
+
+	// AsyncFrames 让 OnFrame/OnFrames 在**独立 goroutine** 里执行（观看端开启）。
+	//
+	// 为什么：pion 的 OnMessage 回调跑在 SCTP 的读 goroutine 上。解码（2K 约
+	// 10~20ms）+ 逐像素统计 + 画面拷贝如果都做在这里，读路径就被我们自己的解码
+	// 堵住 —— 帧在接收缓冲里排队，延迟单调增长，**连 ctl 通道（PLI）一起被堵**，
+	// 于是丢包后连"请求修复"都发不及时。
+	// 开启后：读 goroutine 只把裸分块塞进一个小邮箱（满了覆盖最旧的），
+	// 解析与解码在独立 goroutine 上跑，慢了自己丢块、绝不排队。
+	AsyncFrames bool
+	// OnFrames 是 AsyncFrames 下的**批量**回调：一次给若干块。
+	//
+	// 为什么要批量：单块通常只带 1~2 个条带，而 JPEG 解码一条带就要几毫秒 ——
+	// 逐块串行解码等于把帧内并行度全丢掉（实测 2K 全量 7ms → 98ms）。
+	// 把邮箱里攒着的几块一起交出去，调用方就能用一个并行池把它们的条带一起解。
+	// 设置了 OnFrames 时优先用它；只设 OnFrame 则逐块回调。
+	OnFrames func(frames []*codec.Frame)
+	// OnFrameDrop 在"解码跟不上、丢掉一帧"时回调。
+	//
+	// 在读 goroutine 里调用，必须立刻返回（一般只是置一个原子标志）。
+	// 语义很重要：丢帧等于那几块条带的更新永远没了（增量帧不会重发），
+	// 调用方必须据此把画布标记为不完整并请求全量帧，否则就是 R32 那类
+	// "永久缺一块"。不设则丢帧完全静默。
+	OnFrameDrop func()
 }
 
 // Peer 封装一个 PeerConnection 及两条数据通道。
 type Peer struct {
-	cfg Config
-	pc   *webrtc.PeerConnection
+	cfg      Config
+	pc       *webrtc.PeerConnection
 	media    *webrtc.DataChannel
 	ctl      *webrtc.DataChannel
 	viewerCh *webrtc.DataChannel // 观看端为协商 m-line 而建，见 SetupViewer
 
+	// frameIn / frameDone 是 AsyncFrames 的单槽邮箱与停止信号。
+	frameIn   chan []byte
+	frameDone chan struct{}
+	stopOnce  atomic.Bool
+
 	mu    sync.Mutex
 	stats Stats
-	asm   map[uint32]*frameBuf
+	// lastSeq 用于把"分块计数"折算成"逻辑帧计数"（见 deliver）。
+	lastSeq uint64
 }
 
 // NewPeer 创建 Peer。
@@ -95,9 +158,15 @@ func NewPeer(cfg Config) (*Peer, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Peer{cfg: cfg, pc: pc, asm: map[uint32]*frameBuf{}}
+	p := &Peer{cfg: cfg, pc: pc}
 	if cfg.OnState != nil {
 		pc.OnICEConnectionStateChange(cfg.OnState)
+	}
+	if cfg.AsyncFrames {
+		// 邮箱深度见 chunkBatchMax：够攒一批做并行解码，又不至于压出延迟。
+		p.frameIn = make(chan []byte, chunkBatchMax)
+		p.frameDone = make(chan struct{})
+		go p.frameWorker()
 	}
 	return p, nil
 }
@@ -134,10 +203,111 @@ func (p *Peer) WaitGathering(timeout time.Duration) bool {
 
 // Close 关闭连接。
 func (p *Peer) Close() error {
+	// 先停解码 goroutine：它对 OnFrame 的调用属于"本对象还在用"，
+	// 关完连接再回调容易把上层状态改乱。
+	if p.frameDone != nil && p.stopOnce.CompareAndSwap(false, true) {
+		close(p.frameDone)
+	}
 	if p.pc == nil {
 		return nil
 	}
 	return p.pc.Close()
+}
+
+// frameWorker 是 AsyncFrames 的解析+解码 goroutine：把邮箱里攒着的块**成批**取走，
+// 读 goroutine 从不在这里等它（详见 Config.AsyncFrames / OnFrames）。
+func (p *Peer) frameWorker() {
+	batch := make([][]byte, 0, chunkBatchMax)
+	for {
+		var first []byte
+		select {
+		case <-p.frameDone:
+			return
+		case first = <-p.frameIn:
+		}
+		batch = append(batch[:0], first)
+		// 把邮箱里已经压着的都带上：单块只带 1~2 个条带，
+		// 攒一批才有足够的并行度（见 Config.OnFrames）。
+	drain:
+		for len(batch) < chunkBatchMax {
+			select {
+			case d := <-p.frameIn:
+				batch = append(batch, d)
+			default:
+				break drain
+			}
+		}
+		p.deliverBatch(batch)
+	}
+}
+
+// deliverBatch 解析一批分块并回调（同步路径与异步路径共用）。
+//
+// FramesRecv 按"逻辑帧"计数（同一 seq 的多个分块只算一次），
+// 便于和分享端的发送帧数对齐；分块数另计 ChunksRecv。
+func (p *Peer) deliverBatch(batch [][]byte) {
+	if p.cfg.OnFrames == nil {
+		for _, data := range batch {
+			p.deliver(data)
+		}
+		return
+	}
+	frames := make([]*codec.Frame, 0, len(batch))
+	for _, data := range batch {
+		f, err := codec.UnmarshalFrame(data)
+		if err != nil {
+			p.mu.Lock()
+			p.stats.BadChunks++
+			p.mu.Unlock()
+			continue
+		}
+		p.mu.Lock()
+		p.stats.ChunksRecv++
+		if f.Seq != p.lastSeq {
+			p.lastSeq = f.Seq
+			p.stats.FramesRecv++
+		}
+		p.mu.Unlock()
+		frames = append(frames, f)
+	}
+	if len(frames) > 0 {
+		p.cfg.OnFrames(frames)
+	}
+}
+
+// deliver 解析**一个分块**并回调 OnFrame（单块路径，工具用）。
+func (p *Peer) deliver(data []byte) {
+	f, err := codec.UnmarshalFrame(data)
+	if err != nil {
+		p.mu.Lock()
+		p.stats.BadChunks++
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Lock()
+	p.stats.ChunksRecv++
+	if f.Seq != p.lastSeq {
+		p.lastSeq = f.Seq
+		p.stats.FramesRecv++
+	}
+	p.mu.Unlock()
+	if p.cfg.OnFrame != nil {
+		p.cfg.OnFrame(f)
+	}
+}
+
+// Buffered 返回媒体通道当前积压字节数。
+//
+// 扇出侧用它做"水位"判据：积压接近 SendLimit 就整帧跳过，
+// 而不是等发送接口内部的阈值兜底（那时已经多排了一帧）。
+func (p *Peer) Buffered() uint64 {
+	p.mu.Lock()
+	m := p.media
+	p.mu.Unlock()
+	if m == nil {
+		return 0
+	}
+	return uint64(m.BufferedAmount())
 }
 
 // SetupMedia 由分享端调用：创建 media 与 ctl 两条通道。
@@ -237,23 +407,37 @@ func (p *Peer) WaitReady(timeout time.Duration) error {
 	return errors.New("rtc: 等待媒体通道就绪超时")
 }
 
-// SendFrame 编码并发送一帧。buf 会被切成 ≤60KB 的分片。
+// chunkBatchMax 是"攒一批"的上限（块）。
+//
+// 取 4：太小则并行度不够（单块只有 1~2 个条带），太大则邮箱里会压出额外延迟
+// （4 块 × 60KB 上限，最坏 ~10ms 的处理延迟，超出的老块会被覆盖丢弃 —— 最新优先）。
+const chunkBatchMax = 4
+
+// SendFrame 把一帧切成若干分块并发送（工具/测试用；生产走 SendChunks 共享缓存）。
 func (p *Peer) SendFrame(f *codec.Frame) error {
-	data, err := f.Marshal()
-	if err != nil {
-		return err
+	chunks := f.Split(codec.MaxChunkPayload)
+	wire := make([][]byte, 0, len(chunks))
+	for _, c := range chunks {
+		data, err := c.Marshal()
+		if err != nil {
+			return err
+		}
+		wire = append(wire, data)
 	}
-	return p.SendWire(f.Seq, data)
+	return p.SendChunks(wire)
 }
 
-// SendWire 发送一段**已序列化**的线格式帧（切成 ≤60KB 分片）。
+// SendChunks 发送**已序列化**的若干分块，每个分块一条消息。
 //
-// 为什么从 SendFrame 里拆出来：多观众扇出时 Marshal 是一帧里最大的拷贝
-// （2K 全量约 2MB），旧实现每个观众各 Marshal 一次，全部串在采集 goroutine
-// 上 —— 4 人时全员 fps 腰斩到 15。拆开后管线只 Marshal 一次放进共享缓存，
-// 每个观众的发送 goroutine 各拿同一份线格式数据自己分片发送（见
-// pipeline.Sharer 的"写缓存 / 读缓存"扇出）。
-func (p *Peer) SendWire(seq uint64, data []byte) error {
+// ⚠️ 这里不做分片/重组：分块是编码器按"自带完整帧头 + 完整条带"切好的
+// （见 codec.Frame.Split），对端收到一块就能解一块。所以本函数就是"逐条发"，
+// 没有缓冲区、没有等待、没有超时清理 —— 丢一块只丢它带的条带。
+//
+// 为什么参数是"已序列化的分块列表"：多观众扇出时 Marshal 是一帧里最大的拷贝
+// （2K 全量约 2MB），每个观众各 Marshal 一次会全部串在采集 goroutine 上 ——
+// 4 人时全员 fps 腰斩到 15。管线只 Marshal 一次放进共享缓存，
+// 每个观众的发送 goroutine 各拿同一份数据自己发（见 pipeline.Sharer 的扇出）。
+func (p *Peer) SendChunks(chunks [][]byte) error {
 	p.mu.Lock()
 	m := p.media
 	p.mu.Unlock()
@@ -263,38 +447,27 @@ func (p *Peer) SendWire(seq uint64, data []byte) error {
 	if m.ReadyState() != webrtc.DataChannelStateOpen {
 		return ErrNotOpen
 	}
-	// 背压：宁可丢帧也不让队列无限增长（否则延迟会越拖越大）
-	if m.BufferedAmount() > maxBuffered {
+	total := 0
+	for _, c := range chunks {
+		total += len(c)
+	}
+	// 背压：宁可丢帧也不让队列无限增长（否则延迟会越拖越大）。
+	// 阈值按这一帧的大小算（见 SendLimit）——固定 8MB 等于允许落后 4 帧。
+	if lim := SendLimit(total); m.BufferedAmount() > lim {
 		p.mu.Lock()
 		p.stats.FramesDrop++
 		p.mu.Unlock()
 		return ErrBackpressure
 	}
-	total := (len(data) + chunkPayload - 1) / chunkPayload
-	if total > 65535 {
-		return errors.New("rtc: 帧过大，超出分片上限")
-	}
-	s32 := uint32(seq)
-	sent := 0
-	for i := 0; i < total; i++ {
-		lo := i * chunkPayload
-		hi := lo + chunkPayload
-		if hi > len(data) {
-			hi = len(data)
-		}
-		msg := make([]byte, chunkHeaderLen+hi-lo)
-		binary.BigEndian.PutUint32(msg[0:4], s32)
-		binary.BigEndian.PutUint16(msg[4:6], uint16(i))
-		binary.BigEndian.PutUint16(msg[6:8], uint16(total))
-		copy(msg[chunkHeaderLen:], data[lo:hi])
-		if err := m.Send(msg); err != nil {
+	for _, c := range chunks {
+		if err := m.Send(c); err != nil {
 			return err
 		}
-		sent += len(msg)
 	}
 	p.mu.Lock()
 	p.stats.FramesSent++
-	p.stats.BytesSent += uint64(sent)
+	p.stats.ChunksSent += uint64(len(chunks))
+	p.stats.BytesSent += uint64(total)
 	p.mu.Unlock()
 	return nil
 }
@@ -307,7 +480,8 @@ func (p *Peer) SendWire(seq uint64, data []byte) error {
 type CtlType byte
 
 const (
-	// CtlPLI 观众请求关键帧（分片丢失后用于快速恢复）。
+	// CtlPLI 观众请求"开一轮渐进式修复"（发现画布不完整时用：丢块、丢帧、刚接入）。
+	// 名字沿用 RTP 的 Picture Loss Indication，语义是"我这儿的画面缺东西了"。
 	CtlPLI CtlType = 1
 	// CtlHello 观众上报能力（窗口尺寸、DPI 等），payload 为 JSON。
 	CtlHello CtlType = 2
@@ -332,87 +506,49 @@ func (p *Peer) SendControl(t CtlType, payload []byte) error {
 }
 
 // ---------------------------------------------------------------------------
-// 接收与重组
+// 接收
 // ---------------------------------------------------------------------------
-
-type frameBuf struct {
-	total uint16
-	have  uint16
-	parts [][]byte
-	first time.Time
-}
+//
+// 这里**没有重组层**：每个线路消息就是一个可独立解析的分块（自带帧头 + 完整条带）。
+// 旧实现要把同一帧的所有分块凑齐才解析得出来，于是丢任意一块 = 整帧 2MB 作废
+// （2K 一帧 35 块，丢 1 块的概率不低），观众端只能发 PLI 再要一整帧 ——
+// 拥塞时越要越堵。现在丢一块只丢它带的那几条带，其余照常上屏。
 
 func (p *Peer) onMedia(data []byte) {
-	if len(data) < chunkHeaderLen {
-		return
-	}
-	seq := binary.BigEndian.Uint32(data[0:4])
-	idx := binary.BigEndian.Uint16(data[4:6])
-	total := binary.BigEndian.Uint16(data[6:8])
-	if total == 0 {
-		return
-	}
-
 	p.mu.Lock()
-	fb, ok := p.asm[seq]
-	if !ok {
-		// 清理陈旧重组槽。
-		//
-		// ⚠️ 这里曾经"超过 8 个就随机删一个"，结果把正在重组的活跃帧也删了，
-		// 表现为莫名的丢帧（2K 掉 1 帧、增量掉 2 帧）。不可靠无序通道下分片
-		// 会乱序抵达，同时活跃的帧数可能远超预期 —— 只能按超时清理，不能按数量砍。
-		if len(p.asm) > 32 {
-			for k, v := range p.asm {
-				if time.Since(v.first) > 1500*time.Millisecond {
-					delete(p.asm, k)
-					// 分片始终没凑齐：不可靠通道下的预期行为，记一笔供观众端触发 PLI
-					p.stats.FragLost++
-				}
-			}
+	p.stats.BytesRecv += uint64(len(data))
+	p.mu.Unlock()
+
+	// 异步路径（观看端）：读 goroutine 只把**裸分块**塞进单槽邮箱，
+	// 解析与解码都在独立 goroutine 上（见 Config.AsyncFrames）。
+	// 单槽覆盖式：邮箱里已经压着一块就丢掉更旧的那块、换成最新的 ——
+	// 慢的解码器只丢块，绝不让 SCTP 接收缓冲堆积（那才是"卡起来延迟很长"的根因）。
+	if p.frameIn != nil {
+		select {
+		case p.frameIn <- data:
+			return
+		default:
 		}
-		fb = &frameBuf{total: total, parts: make([][]byte, total), first: time.Now()}
-		p.asm[seq] = fb
-	}
-	if idx >= fb.total || fb.parts[idx] != nil {
-		p.mu.Unlock()
-		return
-	}
-	part := make([]byte, len(data)-chunkHeaderLen)
-	copy(part, data[chunkHeaderLen:])
-	fb.parts[idx] = part
-	fb.have++
-	p.stats.BytesRecv += uint64(len(part))
-	if fb.have < fb.total {
-		p.mu.Unlock()
-		return
-	}
-	// 收齐：拼回完整帧
-	n := 0
-	for _, q := range fb.parts {
-		n += len(q)
-	}
-	full := make([]byte, n)
-	off := 0
-	for _, q := range fb.parts {
-		copy(full[off:], q)
-		off += len(q)
-	}
-	delete(p.asm, seq)
-	p.mu.Unlock()
-
-	f, err := codec.UnmarshalFrame(full)
-	if err != nil {
+		select {
+		case <-p.frameIn: // 丢掉更旧的那块
+		default:
+		}
+		select {
+		case p.frameIn <- data:
+		default:
+		}
 		p.mu.Lock()
-		p.stats.FragLost++
+		p.stats.ChunksSkip++
 		p.mu.Unlock()
+		// 丢掉一块 = 它带的条带内容过期了（增量帧不会重发），
+		// 必须让调用方按完整性位图去要一轮修复。
+		if p.cfg.OnFrameDrop != nil {
+			p.cfg.OnFrameDrop()
+		}
 		return
 	}
-	p.mu.Lock()
-	p.stats.FramesRecv++
-	p.mu.Unlock()
-	if p.cfg.OnFrame != nil {
-		p.cfg.OnFrame(f)
-	}
+
+	p.deliver(data)
 }
 
 // Stats 返回当前统计快照。

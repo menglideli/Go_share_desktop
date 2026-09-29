@@ -123,6 +123,14 @@ type ShellConfig struct {
 	// OnLeaveView 退出观看。
 	OnLeaveView func()
 
+	// Recycle 是观看画面的**归还通道**：渲染线程换掉上一帧时把旧缓冲送回来，
+	// 让解码侧复用同一块内存（见 cmd/goshare 的画面缓冲池）。
+	//
+	// 为什么要复用：2K 一帧 NRGBA 是 20MB，每帧新分配 = 600MB/s 的垃圾，
+	// 解码 goroutine 会被 GC 拖住，进而丢块/丢帧。
+	// nil 表示不复用（离屏校验等场景直接交给 GC）。
+	Recycle chan<- *image.NRGBA
+
 	// ExitAfter 大于 0 时到时自动退出（自动化验证用）。
 	ExitAfter time.Duration
 }
@@ -293,13 +301,33 @@ func (s *Shell) SetJoinState(st JoinState) {
 }
 
 // PushFrame 推送一帧观看画面（覆盖式，只保留最新）。
+//
+// ⚠️ 调用方交出缓冲的所有权：渲染线程用完会通过 ShellConfig.Recycle 归还
+// （不设 Recycle 时交给 GC）。所以同一块缓冲不能再被写入，否则画面上会出现
+// 撕裂 —— 这正是解码侧要维护"缓冲池 + 变化条带同步"的原因。
 func (s *Shell) PushFrame(img *image.NRGBA) {
 	select {
 	case s.frames <- img:
 	default:
-		// 渲染跟不上时丢旧帧 —— 观看端只看最新，不需要积压
-		<-s.frames
+		// 渲染跟不上时丢旧帧 —— 观看端只看最新，不需要积压。
+		// 被丢掉的那块也要归还，否则缓冲池会越用越少（每次都得重新分配）。
+		select {
+		case old := <-s.frames:
+			s.recycle(old)
+		default:
+		}
 		s.frames <- img
+	}
+}
+
+// recycle 把一块用过的画面缓冲还给解码侧（非阻塞：池满了就交给 GC）。
+func (s *Shell) recycle(img *image.NRGBA) {
+	if img == nil || s.cfg.Recycle == nil {
+		return
+	}
+	select {
+	case s.cfg.Recycle <- img:
+	default:
 	}
 }
 
@@ -382,6 +410,9 @@ func (s *Shell) RequestClose(reason string) {
 
 // Run 运行窗口事件循环，阻塞到窗口关闭。
 func (s *Shell) Run(ctx context.Context) error {
+	// 登记主窗标题：防自摄入的最小化/恢复要认准主窗，按标题精确匹配最可靠
+	// （启发式已踩过两次坑，见 winmin_windows.go 的 ownMainWindow）。
+	RegisterMainWindowTitle(s.cfg.Title)
 	w := new(app.Window)
 	w.Option(
 		app.Title(s.cfg.Title),
@@ -433,15 +464,21 @@ func (s *Shell) Run(ctx context.Context) error {
 			return e.Err
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
+			if frames.Load() == 0 {
+				log.Printf("shell: 首帧 尺寸=%v PxPerDp=%.3f PxPerSp=%.3f", e.Size, gtx.Metric.PxPerDp, gtx.Metric.PxPerSp)
+			}
 
 			// 观看端：只保留最新帧
 			select {
 			case f := <-s.frames:
 				if f != nil {
 					s.mu.Lock()
+					old := s.lastFrame
 					s.lastFrame = f
 					s.viewW, s.viewH = f.Bounds().Dx(), f.Bounds().Dy()
 					s.mu.Unlock()
+					// 上一帧用完即还（解码侧靠它复用缓冲）。
+					s.recycle(old)
 				}
 			default:
 			}
