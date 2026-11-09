@@ -267,6 +267,23 @@ func cases() []testCase {
 			s.SetSetupNote("")
 			s.PushPreview(synth(480, 270))
 		}},
+		{name: "sharing-sync", setup: func(s *ui.Shell) {
+			// P0-5：观众回报同步状态后的列表外观。一个正点、一个掉队（标黄）。
+			s.SetShareState(ui.ShareState{
+				Active: true, Code: "482913", Addrs: fakeAddrs, Port: 9000,
+				PresetName: "最大", Paused: false,
+				Viewers: []ui.ViewerRow{
+					{Name: "DESKTOP-EXAMPLE", IP: "192.0.2.180", Since: now.Add(-75 * time.Second),
+						Seq: 1842, LateMS: 0, BehindMS: 0, SyncKnown: true},
+					{Name: "DESKTOP-7K2", IP: "192.0.2.191", Since: now.Add(-12 * time.Second),
+						Seq: 1795, LateMS: 210, BehindMS: 620, SyncKnown: true},
+				},
+				HUD:        "发送 29.8 fps · 7.4 Mbps\n编码 9.9 ms · 采集 duplication\n已发 1842 帧 · 观众 2 人\n共享 整屏",
+				RegionText: "整屏",
+			})
+			s.SetSetupNote("")
+			s.PushPreview(synth(480, 270))
+		}},
 		{name: "sharing-paused", setup: func(s *ui.Shell) {
 			s.SetShareState(ui.ShareState{
 				Active: true, Code: "482913", Addrs: fakeAddrs, Port: 9000,

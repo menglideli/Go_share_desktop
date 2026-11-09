@@ -628,8 +628,21 @@ func (s *Shell) pageSharing(gtx layout.Context, th *material.Theme) layout.Dimen
 									return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 										layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 											d := time.Since(v.Since).Truncate(time.Second)
-											l := material.Body2(th, fmt.Sprintf("%s · %v", v.Name, d))
-											l.Color = colText
+											txt := fmt.Sprintf("%s · %v", v.Name, d)
+											col := colText
+											if v.SyncKnown {
+												// 同步状态（P0-5）：显示帧号让"多端是否在同一帧"肉眼可查；
+												// 落后超过 200ms 标黄，掉队者一眼看到。
+												txt = fmt.Sprintf("%s · %v · #%d", v.Name, d, v.Seq)
+												if v.BehindMS > 0 {
+													txt += fmt.Sprintf(" 落后 %d ms", v.BehindMS)
+												}
+												if v.BehindMS > 200 || v.LateMS > 200 {
+													col = colWarn
+												}
+											}
+											l := material.Body2(th, txt)
+											l.Color = col
 											return l.Layout(gtx)
 										}),
 										layout.Rigid(func(gtx layout.Context) layout.Dimensions {

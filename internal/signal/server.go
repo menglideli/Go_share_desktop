@@ -232,13 +232,16 @@ func (s *Server) Viewers() []ViewerInfo {
 	defer s.mu.Unlock()
 	out := make([]ViewerInfo, 0, len(s.viewers))
 	for _, v := range s.viewers {
-		out = append(out, ViewerInfo{Name: v.Name, IP: v.RemoteIP, Joined: v.Joined})
+		out = append(out, ViewerInfo{Token: v.Token, Name: v.Name, IP: v.RemoteIP, Joined: v.Joined})
 	}
 	return out
 }
 
 // ViewerInfo 是界面上展示的观众条目（阶段 4 踢人按钮要用）。
 type ViewerInfo struct {
+	// Token 是本次接入的唯一标识：同一台机器开多个观众时 IP 完全相同，
+	// 只有 token 能区分"这份落后统计属于谁"（P0-5）。
+	Token  string
 	Name   string
 	IP     string
 	Joined time.Time

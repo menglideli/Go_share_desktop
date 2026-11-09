@@ -52,6 +52,13 @@ type ViewerRow struct {
 	IP   string
 	// Since 是加入时刻，界面显示"已观看 xx:xx"。
 	Since time.Time
+	// Seq / LateMS / BehindMS 是观众回报的同步状态（P0-5）：
+	// 当前显示帧号、上屏迟到毫秒、落后共同时间线多少毫秒。
+	// SyncKnown=false 时界面保持旧版显示（旧客户端不会回报）。
+	Seq       uint64
+	LateMS    int64
+	BehindMS  int64
+	SyncKnown bool
 }
 
 // FoundRow 是局域网发现列表的一行。

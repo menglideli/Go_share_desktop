@@ -63,6 +63,9 @@ func main() {
 	switchDisp := flag.Int("switch-display", -1, "分享开始 N 秒后热切换到第 N 台显示器（配合 -switch-at，-1 = 不换屏）")
 	keyInterval := flag.Duration("key-interval", 0, "稳态周期性全量帧间隔（0/负值=禁用，靠观众请求恢复）")
 	keyBurst := flag.Duration("key-burst", 3*time.Second, "新观众接入后的密集补帧窗口（负值禁用）")
+	// P0-5 的旋钮：多个观众"同一时刻看到同一帧"要付出的固定延迟。
+	// 0 = 关闭同步（回到"收到就显示"，延迟最低但各看各的）。
+	playoutMS := flag.Int("playout", 80, "观看端播放缓冲（毫秒）：多端同步要付出的固定延迟，0 = 关闭同步")
 	flag.Parse()
 
 	if *logPath != "" {
@@ -101,7 +104,14 @@ func main() {
 		keyInterval: *keyInterval, keyBurst: *keyBurst,
 		switchAt: *switchAt, switchRegion: *switchRegion,
 		switchDisp: *switchDisp, displays: ds,
-		disp: newDispPool(),
+		disp:     newDispPool(),
+		playoutMS: *playoutMS,
+	}
+	a.clock = &rtc.Clock{}
+	a.pl = newPlayout(a.disp.Recycle())
+	go a.pl.run(ctx, a.presentFrame)
+	if a.playoutMS > 0 {
+		log.Printf("观看端播放缓冲 %d ms（多端同步；0 = 关闭）", a.playoutMS)
 	}
 	title := "GoShare · 内网桌面共享"
 	if version != "dev" {
@@ -312,6 +322,38 @@ type app struct {
 
 	// pliTarget 记录本次接入的 peer，供状态循环重试请求。
 	pliTarget *rtc.Peer
+
+	// ---- P0-5 同步观看 ----
+	// playoutMS 是播放缓冲 D（毫秒，0 = 关闭同步）：所有观众等 `帧 TS + D` 才上屏。
+	playoutMS int
+	// clock 估计"分享端时钟 - 本端时钟"的偏移（见 internal/rtc/clock.go）。
+	clock *rtc.Clock
+	// pl 是呈现调度器（见 playout.go）。
+	pl *playout
+	// wDispSeq / wDispLate 是**实际上屏**的帧号与迟到毫秒数。
+	// 它们是"多端一致性"的观察点：同一时刻各观众的 wDispSeq 必须相同。
+	wDispSeq  atomic.Uint64
+	wDispLate atomic.Int64
+	// wSyncRTT 是最近一次时钟同步样本的 ctl 往返（毫秒，仅诊断）。
+	wSyncRTT atomic.Int64
+	// wRepBucket 是上次上报落后量的"分享端时钟 500ms 桶"（只由播放 goroutine 访问）。
+	wRepBucket uint32
+	// vstatMu / vstat 保存各观众最近一次落后回报（key = 接入 token）。
+	vstatMu sync.Mutex
+	vstat   map[string]viewerStat
+}
+
+// viewerStat 是观众每 500ms 回报一次的上屏状态（CtlStats 的 payload）。
+type viewerStat struct {
+	Seq    uint64 `json:"seq"`    // 当前显示帧的序号
+	TS     uint32 `json:"ts"`     // 当前显示帧的编码时刻（分享端时钟毫秒）
+	LateMS int64  `json:"lateMs"` // 上屏迟到了多少毫秒（0 = 正点）
+	DMS    int    `json:"d"`      // 该观众自己的播放缓冲
+	// At 是采样时刻（分享端时钟毫秒）：所有观众按同一个 500ms 桶采样，
+	// 分享端才能比较"同一时刻大家显示的是哪一帧"。
+	At uint32 `json:"at"`
+	// recvAt 是分享端收到它的本地时刻（不参与线格式，用于判断是否过期）。
+	recvAt time.Time
 }
 
 // pliMinInterval 是请求修复的最小间隔；pliMaxBackoff 是退避上限。
@@ -500,6 +542,7 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 					_ = peer.Close()
 				}
 				srv.Detach(req.Token)
+				a.clearViewerStat(req.Token)
 				log.Printf("观众 %s 已释放（%s），剩余 %d 人", req.RemoteIP, reason, sh.PeerCount())
 			}()
 		}
@@ -537,6 +580,24 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 					// 比开一整轮轮转修复（十几帧、几百 KB）省一个量级。
 					if mask, ok := rtc.ParseMissing(payload); ok && mask != 0 {
 						sh.RequestTiles(mask)
+					}
+				case rtc.CtlTimePing:
+					// 时钟同步：原样带回 t0，填上"收到"和"回复"两个时刻。
+					// 从 ctl 的读 goroutine 直接回一条几十字节的消息，不做任何等待。
+					t0, _, _, _, ok := rtc.ParseTimePayload(payload)
+					if !ok {
+						return
+					}
+					t1 := uint32(time.Now().UnixMilli())
+					t2 := uint32(time.Now().UnixMilli())
+					if peer != nil {
+						_ = peer.SendControl(rtc.CtlTimePong, rtc.TimePayload(t0, t1, t2, 0))
+					}
+				case rtc.CtlStats:
+					// 观众每 500ms 回报"正在显示第几帧、晚了多少"。
+					// 分享端的观众列表据此标出掉队者（P0-5 的可观测性）。
+					if st, ok := parseViewerStat(payload); ok {
+						a.setViewerStat(req.Token, st)
 					}
 				}
 			},
@@ -760,7 +821,22 @@ func (a *app) pushShareState() {
 
 	rows := make([]ui.ViewerRow, 0, 8)
 	for _, v := range srv.Viewers() {
-		rows = append(rows, ui.ViewerRow{Name: v.Name, IP: v.IP, Since: v.Joined})
+		row := ui.ViewerRow{Name: v.Name, IP: v.IP, Since: v.Joined}
+		// 落后信息来自观众每 500ms 一次的回报（CtlStats）。
+		// 3 秒没更新就当未知（静止桌面 / ctl 堵了），不能拿旧值误导人。
+		if vs, ok := a.viewerStatOf(v.Token); ok {
+			row.Seq = vs.Seq
+			row.LateMS = vs.LateMS
+			row.SyncKnown = true
+			// 落后 = 采样时"这帧已经多老"再减掉它本该等待的播放缓冲。
+			// 用**时间**而不是帧数：发送侧丢帧会让帧号出现永久空档，
+			// 按序号相减会把"跳过一帧"错报成"落后好几帧"（实测踩过）。
+			age := int64(int32(vs.At - vs.TS))
+			if behind := age - int64(vs.DMS); behind > 0 {
+				row.BehindMS = behind
+			}
+		}
+		rows = append(rows, row)
 	}
 
 	regionText := "整屏"
@@ -813,6 +889,11 @@ func (a *app) pushShareState() {
 	if tick%6 == 0 {
 		log.Printf("分享统计：%.1f fps · 出网 %.2f Mbps（单路 %.2f × %d 人）· 编码均值 %.1f ms · 全量帧 %d/%d · 观众 %d 人",
 			fps, outMbps, mbps, len(rows), encAvg, st.Keys, st.Frames, len(rows))
+		// 多端一致性证据：一条日志里列出每个观众**同一时刻**显示到第几帧。
+		// 所有观众按同一个 `帧 TS + D` 时间线上屏，所以这里的 seq 应当一致（±1）。
+		if synced := syncLine(rows); synced != "" {
+			log.Printf("同步检查：分享端 #%d · %s", st.Frames, synced)
+		}
 	}
 
 	a.shell.SetShareState(ui.ShareState{
@@ -1118,6 +1199,19 @@ func (a *app) dialOnce(dec *codec.Decoder, addr, code string) (*signal.Session, 
 			// 不这么做的话，读路径被我们自己的解码（2K 约 10~20ms/帧）堵住，
 			// 帧在接收缓冲里排队 → 延迟单调增长，连 PLI 都发不及时。
 			AsyncFrames: true,
+			// 时钟同步的另一半：分享端回的 pong 在这里换算成"分享端 - 本端"的偏移。
+			// 它跑在 ctl 的读 goroutine 上，只做一次算术 + 加锁，不能做重活。
+			OnControl: func(t rtc.CtlType, payload []byte) {
+				if t != rtc.CtlTimePong {
+					return
+				}
+				t0, t1, t2, _, ok := rtc.ParseTimePayload(payload)
+				if !ok {
+					return
+				}
+				a.clock.Observe(t0, t1, t2, uint32(time.Now().UnixMilli()))
+				a.wSyncRTT.Store(int64(a.clock.RTT()))
+			},
 			// 丢掉一块 = 它带的条带更新永远没了（增量帧不会重发）。
 			// 必须让状态循环去要对端开一轮修复，否则就是"永久缺一块"（R32 同类）。
 			OnFrameDrop: func() {
@@ -1245,11 +1339,21 @@ func (a *app) dialOnce(dec *codec.Decoder, addr, code string) (*signal.Session, 
 						log.Printf("诊断：落盘失败: %v", err)
 					}
 				}
-				// 交给界面：从**缓冲池**取一块（已经与解码画布同步）。
-				// 不再每帧新分配 20MB —— 那等于 600MB/s 的垃圾，
-				// 解码 goroutine 会被 GC 拖住，进而丢块。
+				// 交给呈现调度器：**不再收到就显示**，而是按统一时间线上屏
+				// （帧 TS + 播放缓冲 D，换算到本端时钟，见 playout.go / internal/rtc/clock.go）。
+				// D=0 或时钟还没同步上时 due 就是"现在"，行为与旧版一致。
+				// 缓冲必须从这个池子里取：它已经与解码画布同步，且不上屏时会被回收复用。
 				if buf := a.disp.Take(dec); buf != nil {
-					a.shell.PushFrame(buf)
+					if a.pl == nil {
+						a.shell.PushFrame(buf)
+						return
+					}
+					it := playoutItem{img: buf, seq: lastSeq, ts: uint32(f0.TS), due: time.Now()}
+					if wait, ok := a.clock.Wait(uint32(f0.TS),
+						time.Duration(a.playoutMS)*time.Millisecond); ok && wait > 0 {
+						it.due = time.Now().Add(wait)
+					}
+					a.pl.push(it)
 				}
 			},
 		},
@@ -1340,6 +1444,11 @@ func (a *app) watchStatusLoop(dec *codec.Decoder) {
 			return
 		case <-t.C:
 		}
+		// 时钟同步：刚接入时连发两拍（尽快跟上时间线），之后每 2 秒一次。
+		// 一条 ping/pong 只有几十字节，走可靠 ctl，不占媒体通道。
+		if ticks < 2 || ticks%4 == 0 {
+			a.pingClock(sess.Peer)
+		}
 		a.mu.Lock()
 		el := time.Since(a.wStart).Seconds()
 		fps := 0.0
@@ -1350,6 +1459,12 @@ func (a *app) watchStatusLoop(dec *codec.Decoder) {
 		}
 		st := fmt.Sprintf("%s · %.1f fps · %.1f Mbps · 解码 %.1f ms · 延迟 %.0f ms",
 			sess.Info.Name, fps, mbps, a.wDec, a.wLatMS)
+		if a.playoutMS > 0 {
+			if _, ok := a.clock.Offset(); ok {
+				st += fmt.Sprintf(" · 显示 #%d 晚 %d ms",
+					a.wDispSeq.Load(), a.wDispLate.Load())
+			}
+		}
 		nb, lum, fr := a.wNonBlack, a.wLum, a.wFrames
 		a.mu.Unlock()
 
@@ -1428,9 +1543,11 @@ func (a *app) watchStatusLoop(dec *codec.Decoder) {
 			if batches > 0 {
 				avgBatch = float64(chunks) / float64(batches)
 			}
-			log.Printf("观看统计：%s · 非黑 %.1f%% · 亮度 %.1f · 已收 %d 帧/%d 块（均 %.1f 块/批）· 解码跳块 %d · 坏块 %d · 画布完整=%v · 缓冲池 空闲%d/持有%d/兜底累计%d",
+			log.Printf("观看统计：%s · 非黑 %.1f%% · 亮度 %.1f · 已收 %d 帧/%d 块（均 %.1f 块/批）· 解码跳块 %d · 坏块 %d · 画布完整=%v · 缓冲池 空闲%d/持有%d/兜底累计%d · 上屏 #%d 晚 %dms · 同步 %+dms(rtt %dms) · 播放队列丢弃 %d",
 				st, nb*100, lum, fr, chunks, avgBatch, a.wSkipped.Load(), ps.BadChunks, !a.needFull.Load(),
-				freeN, heldN, missN)
+				freeN, heldN, missN, a.wDispSeq.Load(), a.wDispLate.Load(),
+				func() int32 { o, _ := a.clock.Offset(); return o }(), a.wSyncRTT.Load(),
+				a.pl.dropped.Load())
 		}
 	}
 }

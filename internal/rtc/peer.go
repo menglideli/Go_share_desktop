@@ -497,7 +497,37 @@ const (
 	// （codec.Decoder.Missing），报上来就能一帧补齐、只花几十 KB。
 	// payload = 8 字节大端位图，编码与 Frame.TilesMask 一致。
 	CtlMissing CtlType = 5
+	// CtlTimePing 观众 → 分享端：一次时钟同步往返的请求（P0-5 多端一致）。
+	// payload 是 16 字节（4 个 uint32 毫秒时间戳），只有 t0 有效。
+	CtlTimePing CtlType = 6
+	// CtlTimePong 分享端 → 观众：带回 t0，并填上 t1（收到）与 t2（回复）。
+	// 观众收到时补上 t3，就能算出"分享端时钟 - 本端时钟"的偏移（见 clockSync）。
+	CtlTimePong CtlType = 7
 )
+
+// TimePayload 把四个毫秒时间戳编码成 ctl 的 16 字节 payload。
+//
+// 为什么是 32 位毫秒：与 Frame.TS 的线格式完全一致，差值用 uint32 环绕运算
+// 就能跨过 2^32 毫秒（约 49.7 天）边界，两端墙钟本来也不需要一致。
+func TimePayload(t0, t1, t2, t3 uint32) []byte {
+	b := make([]byte, 16)
+	binary.BigEndian.PutUint32(b[0:4], t0)
+	binary.BigEndian.PutUint32(b[4:8], t1)
+	binary.BigEndian.PutUint32(b[8:12], t2)
+	binary.BigEndian.PutUint32(b[12:16], t3)
+	return b
+}
+
+// ParseTimePayload 解析 CtlTimePing / CtlTimePong 的 payload。
+func ParseTimePayload(payload []byte) (t0, t1, t2, t3 uint32, ok bool) {
+	if len(payload) < 16 {
+		return 0, 0, 0, 0, false
+	}
+	return binary.BigEndian.Uint32(payload[0:4]),
+		binary.BigEndian.Uint32(payload[4:8]),
+		binary.BigEndian.Uint32(payload[8:12]),
+		binary.BigEndian.Uint32(payload[12:16]), true
+}
 
 // MissingPayload 把条带位图编码成 CtlMissing 的 payload。
 func MissingPayload(mask uint64) []byte {

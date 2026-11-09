@@ -215,15 +215,26 @@ func main() {
 	sk := &sink{}
 	t0 := time.Now()
 
+	// pongs 收集时钟同步的回复（[5] 时钟同步用）。
+	pongs := make(chan [3]uint32, 8)
+
 	viewer, err := rtc.NewPeer(rtc.Config{
 		// 与生产观看端同一条路径：异步 + 批量解析解码。
 		AsyncFrames: true,
 		OnFrames:    sk.onFrames,
 		OnControl: func(t rtc.CtlType, payload []byte) {
-			if t == rtc.CtlPLI {
+			switch t {
+			case rtc.CtlPLI:
 				sk.mu.Lock()
 				sk.pli++
 				sk.mu.Unlock()
+			case rtc.CtlTimePong:
+				if a, b, c, _, ok := rtc.ParseTimePayload(payload); ok {
+					select {
+					case pongs <- [3]uint32{a, b, c}:
+					default:
+					}
+				}
 			}
 		},
 	})
@@ -232,7 +243,21 @@ func main() {
 		os.Exit(1)
 	}
 	defer viewer.Close()
-	host, err := rtc.NewPeer(rtc.Config{})
+	// 分享端要回到观众发来的 ping，所以先声明再用（闭包捕获这个变量）。
+	var host *rtc.Peer
+	host, err = rtc.NewPeer(rtc.Config{
+		OnControl: func(t rtc.CtlType, payload []byte) {
+			if t != rtc.CtlTimePing {
+				return
+			}
+			t0, _, _, _, ok := rtc.ParseTimePayload(payload)
+			if !ok {
+				return
+			}
+			t1 := uint32(time.Now().UnixMilli())
+			_ = host.SendControl(rtc.CtlTimePong, rtc.TimePayload(t0, t1, t1, 0))
+		},
+	})
 	if err != nil {
 		fmt.Printf("分享端创建失败: %v\n", err)
 		os.Exit(1)
@@ -299,6 +324,10 @@ func main() {
 
 	fmt.Printf("\n[4] 丢块恢复：故意丢 1 个分块，验证「只丢它带的条带」+ 渐进式修复\n")
 	runLossRepair(sk, host)
+
+	fmt.Printf("\n[5] 时钟同步：ctl ping/pong 四时间戳 → 偏移估计（P0-5 的地基）\n")
+	// 方向必须与生产一致：观众发 ping、分享端回 pong。
+	runClockSync(viewer, pongs)
 
 	fmt.Printf("\n------------------------------------------------------------\n")
 	fmt.Printf("结果: %d 通过 / %d 失败\n\n", pass, fail)
@@ -551,6 +580,51 @@ func runLossRepair(sk *sink, host *rtc.Peer) {
 	check("修复不产生大突发", maxRepairFrame*4 <= full.Bytes,
 		fmt.Sprintf("单帧最大 %d KB ≤ 全量帧的 1/4（%d KB）· 修复总流量 %d KB（全量帧 %d KB）",
 			maxRepairFrame/1024, full.Bytes/4096, repairBytes/1024, full.Bytes/1024))
+}
+
+// runClockSync 验证时钟同步的完整链路（P0-5 的地基）：
+// 观众发 ping → 分享端回 pong → 观众算出偏移 / RTT → 换算呈现时刻。
+//
+// 这里用的是 rtc.Clock 这份**生产代码**，不是复制的小实现 —— 否则测的只是测试。
+// 同机回环的真实偏移恒为 0，所以断言是"估计值接近 0 + RTT 是毫秒级"；
+// 偏移算错（例如时间戳顺序写反）会直接落到几毫秒以外。
+func runClockSync(host *rtc.Peer, pongs chan [3]uint32) {
+	var clk rtc.Clock
+	sent := 0
+	for sent < 3 {
+		t0 := uint32(time.Now().UnixMilli())
+		if err := host.SendControl(rtc.CtlTimePing, rtc.TimePayload(t0, 0, 0, 0)); err != nil {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		sent++
+		select {
+		case p := <-pongs:
+			clk.Observe(p[0], p[1], p[2], uint32(time.Now().UnixMilli()))
+		case <-time.After(time.Second):
+			check("时钟同步 收到 pong", false, "1 秒内没有回复")
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	off, ok := clk.Offset()
+	rtt := clk.RTT()
+	check("时钟同步 偏移估计", ok && off >= -5 && off <= 5,
+		fmt.Sprintf("offset=%+d ms（同机真实值 0）· %d 个样本", off, sent))
+	check("时钟同步 往返时延", ok && rtt >= 0 && rtt < 30,
+		fmt.Sprintf("%d ms（ctl 可靠通道，回环应为个位数）", rtt))
+
+	// 呈现时刻换算：TS=现在、D=80ms → 应当还要等 ~80ms；
+	// D=0 → 已经晚了（立即上屏）。这是"多端同一时刻显示同一帧"的核心算式。
+	now := uint32(time.Now().UnixMilli())
+	d80, ok80 := clk.Wait(now, 80*time.Millisecond)
+	d0, ok0 := clk.Wait(now, 0)
+	check("时钟同步 呈现时刻（D=80ms）",
+		ok80 && d80 >= 70*time.Millisecond && d80 <= 95*time.Millisecond,
+		fmt.Sprintf("剩余 %v", d80.Truncate(time.Millisecond)))
+	check("时钟同步 关闭同步（D=0）", ok0 && d0 <= 0,
+		fmt.Sprintf("D=0 时不等（剩余 %v，即立即上屏）", d0.Truncate(time.Millisecond)))
 }
 
 // missingMask 返回画布上"内容已过期"的条带位图（精确补发用）。
