@@ -880,10 +880,9 @@ func (s *Sharer) emit(f capture.Frame) error {
 	}
 	s.mu.Unlock()
 
-	if s.cfg.OnFrame != nil {
-		s.cfg.OnFrame(out, f)
-	}
 	if len(slots) == 0 {
+		// 没人看的时候只剩本地回显要做。
+		s.runPreview(out, f)
 		return nil
 	}
 	// 写共享缓存：线格式只序列化一次（旧实现每个观众各 Marshal 一遍，
@@ -909,5 +908,15 @@ func (s *Sharer) emit(f capture.Frame) error {
 		default:
 		}
 	}
+	// 本地回显**排在唤醒之后**（P1-6）：先把这一帧交给发送 goroutine，
+	// 再做预览的缩放/绘制。预览 1~5ms 的耗时因此不再算进观众看到的延迟。
+	s.runPreview(out, f)
 	return nil
+}
+
+// runPreview 刷新分享端的本地回显（可选回调）。
+func (s *Sharer) runPreview(out *codec.Frame, f capture.Frame) {
+	if s.cfg.OnFrame != nil {
+		s.cfg.OnFrame(out, f)
+	}
 }

@@ -40,6 +40,12 @@ const (
 	udpPortMax = 50100
 )
 
+// previewInterval 是分享端本地回显的最高刷新间隔（约 10fps）。
+//
+// 回显只是让分享者确认"在推什么"，30fps 的渲染纯属浪费 —— 尤其在主窗被最小化
+// （防自摄入的常态）时根本看不见。帧本身仍然 30fps 发给观众，不受这个节流影响。
+const previewInterval = 100 * time.Millisecond
+
 func main() {
 	logPath := flag.String("log", "", "日志文件路径（默认输出到控制台）")
 	exitAfter := flag.Duration("exit", 0, "自动退出时长（自动化验证用，如 20s）")
@@ -239,6 +245,10 @@ type app struct {
 	lastSent   uint64
 	lastAt     time.Time
 	view       *ui.View
+	// lastPreviewAt / previewUs 是本地回显的节流与耗时。
+	// lastPreviewAt 只由分享管线那个 goroutine 读写（OnFrame 回调），不需要锁。
+	lastPreviewAt time.Time
+	previewUs     atomic.Int64
 
 	// ---- 观看端 ----
 	sess *signal.Session
@@ -499,6 +509,15 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 		KeyBurst:    a.keyBurst,
 		KeyInterval: a.keyInterval,
 		OnFrame: func(f *codec.Frame, src capture.Frame) {
+			// 预览限到 ~10fps：本地回显没人会盯着看 30fps，省下的 CPU 留给编码；
+			// 它已经在发送路径**之后**执行（见 pipeline.emit），所以这里耗时
+			// 不再算进"编码完成 → 观众收到"的延迟。
+			now := time.Now()
+			if now.Sub(a.lastPreviewAt) < previewInterval {
+				return
+			}
+			a.lastPreviewAt = now
+			t0 := now
 			a.mu.Lock()
 			v := a.view
 			a.mu.Unlock()
@@ -508,6 +527,7 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 			v.Update(src)
 			v.Render()
 			a.shell.PushPreview(v.Image())
+			a.previewUs.Store(time.Since(t0).Microseconds())
 		},
 	})
 	if err != nil {
@@ -898,8 +918,8 @@ func (a *app) pushShareState() {
 	tick := a.hudTicks
 	a.mu.Unlock()
 	if tick%6 == 0 {
-		log.Printf("分享统计：%.1f fps · 出网 %.2f Mbps（单路 %.2f × %d 人）· 编码均值 %.1f ms · 全量帧 %d/%d · 观众 %d 人",
-			fps, outMbps, mbps, len(rows), encAvg, st.Keys, st.Frames, len(rows))
+		log.Printf("分享统计：%.1f fps · 出网 %.2f Mbps（单路 %.2f × %d 人）· 编码均值 %.1f ms · 预览 %.1f ms · 全量帧 %d/%d · 观众 %d 人",
+			fps, outMbps, mbps, len(rows), encAvg, float64(a.previewUs.Load())/1000, st.Keys, st.Frames, len(rows))
 		// 多端一致性证据：一条日志里列出每个观众**同一时刻**显示到第几帧。
 		// 所有观众按同一个 `帧 TS + D` 时间线上屏，所以这里的 seq 应当一致（±1）。
 		if synced := syncLine(rows); synced != "" {
