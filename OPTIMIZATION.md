@@ -9,6 +9,33 @@
 
 ---
 
+## 进度速览（2026-11-09 收工）
+
+| 项 | 状态 | 证据 / 备注 |
+|---|---|---|
+| **P0-5 多端一致** | ✅ 已完成（判据全中） | 3 观众同帧 ±1、晚 0ms、落后 0ms；netcheck 25/25；提交 `60f18f7` |
+| **P1-1 条带 32px** | ✅ 已完成（判据全中） | 光标 -35%、打字 -56%、全量 +3.4%、编码反降；提交 `a0beb1d` |
+| **P1-6 预览移出关键路径** | 🟡 已实现，**延迟数字待测** | netcheck/uicheck/test 全绿；实现时工作站已锁屏，capture 不可用；提交 `f8a221a` |
+| P0-2 「流畅60」假 60fps | ⬜ 未开始（下一项） | 见下方「下次开工」 |
+
+**下次开工从这里开始（按顺序）**
+
+1. **解锁屏幕**（现在 `LockApp.exe` 在跑，锁定状态下 `capcheck` 必红、e2e 采不到画面）。
+2. **补 P1-6 的数字**：起一个分享端 + 一个观众端，看分享日志「预览 X ms」与观众端
+   「延迟 Y ms」；Y 应比改动前少掉接近 X。命令示例：
+   `./out/gs-dev.exe -auto share -port 9100 -code 2468 -preset 流畅30 -log out/p16-host.log`
+   + `./out/gs-dev.exe -auto watch -addr 127.0.0.1:9100 -code-watch 2468 -log out/p16-v.log`。
+   顺手把 `capcheck` 复跑到 12/12（解锁后）。
+3. **做 P0-2**：`pipeline.Config.FPS` 默认 30（`sharer.go:112`）→ `capture.Options.FPS`
+   （`NewSharer` 里传 `cfg.FPS`）；档位只限制“发送”（`Run` 里 MaxFPS）。修法是让
+   `Preset.MaxFPS` **驱动采集帧率**（上限 60），并保留 2K 下自动回落 30 的保护。
+   判据：1080p「流畅60」≥55fps；2K 仍 ≤30 且 HUD 说明原因；编码耗时与延迟不退化。
+
+> ⚠️ **本地未推送**：`main` 领先 `origin/main` 5 个提交（按约定不 push）。
+> 另：仓库仍无 LICENSE；`PLAN.md`/`VERIFY.md`/`.workbuddy` 是否公开还没定。
+
+---
+
 ## 0. 当前基线（都是本机实测，改之前先记住）
 
 环境：Windows 10 LTSC 17763 · 2880×1800@175%（主屏）+ 1920×1080@100% · 20 逻辑核 · Iris Xe ·
