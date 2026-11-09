@@ -27,22 +27,30 @@ import (
 // 帧率语义：MaxFPS=0 表示"最大"——不主动限帧，出帧节奏由桌面变化率与编码能力决定。
 // DXGI 本身是变化驱动的（桌面不动就不出帧），所以"最大"不会空转烧 CPU。
 type Preset struct {
-	Name    string
+	Name string
+	// Quality 是 JPEG 质量。
 	Quality int
-	Tiles   int
-	Dirty   bool
-	MaxFPS  int // 0 = 不限（最大）
+	// Tiles 是显式条带数（<=0 = 按 TileHeight 算）。
+	Tiles int
+	// TileHeight 是目标条带高度（像素）：0 = 用 Tiles / NumCPU。
+	//
+	// 32px 是实测选的：2K 下 57 条，光标闪动的每帧字节从 64.8KB 降到 41.9KB
+	// （-35%），打字类 -56%；全量帧只多 3.4% 的 JPEG 头，编码耗时反而略降
+	// （每帧重编的面积小了）。见 `cmd/tilebench`。
+	TileHeight int
+	Dirty      bool
+	MaxFPS     int // 0 = 不限（最大）
 }
 
 var (
 	// PresetMax 是默认档：不限帧率，画质优先。
-	PresetMax = Preset{Name: "最大", Quality: 75, Tiles: 0, Dirty: true, MaxFPS: 0}
+	PresetMax = Preset{Name: "最大", Quality: 75, TileHeight: 32, Dirty: true, MaxFPS: 0}
 	// Preset60 上限 60fps。
-	Preset60 = Preset{Name: "流畅60", Quality: 75, Tiles: 0, Dirty: true, MaxFPS: 60}
+	Preset60 = Preset{Name: "流畅60", Quality: 75, TileHeight: 32, Dirty: true, MaxFPS: 60}
 	// Preset30 上限 30fps，最省带宽，适合人数多或弱网。
-	Preset30 = Preset{Name: "流畅30", Quality: 80, Tiles: 0, Dirty: true, MaxFPS: 30}
-	// PresetTurbo 急速：更多条带带来更细的增量粒度，略降质量换最低延迟。
-	PresetTurbo = Preset{Name: "急速", Quality: 65, Tiles: 40, Dirty: true, MaxFPS: 0}
+	Preset30 = Preset{Name: "流畅30", Quality: 80, TileHeight: 32, Dirty: true, MaxFPS: 30}
+	// PresetTurbo 急速：略降质量换最低延迟（条带粒度同上，全量帧编码并不更慢）。
+	PresetTurbo = Preset{Name: "急速", Quality: 65, TileHeight: 32, Dirty: true, MaxFPS: 0}
 )
 
 // Presets 是可选档位顺序（UI 直接遍历即可）。
@@ -407,8 +415,13 @@ func NewSharer(ctx context.Context, cfg Config) (*Sharer, error) {
 		_, _ = src.Warmup(ctx, 3, cfg.Warmup)
 	}
 	sh := &Sharer{
-		cfg:       cfg,
-		enc:       codec.NewEncoder(codec.Config{Quality: cfg.Preset.Quality, Tiles: cfg.Preset.Tiles, Dirty: cfg.Preset.Dirty}),
+		cfg: cfg,
+		enc: codec.NewEncoder(codec.Config{
+			Quality:    cfg.Preset.Quality,
+			Tiles:      cfg.Preset.Tiles,
+			TileHeight: cfg.Preset.TileHeight,
+			Dirty:      cfg.Preset.Dirty,
+		}),
 		peers:     map[*rtc.Peer]*peerSlot{},
 		lastKeyAt: time.Now(),
 	}

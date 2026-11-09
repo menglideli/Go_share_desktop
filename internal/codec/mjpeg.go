@@ -44,6 +44,13 @@ type Config struct {
 	// Tiles 是水平条带数量，<=0 时取 NumCPU。更多条带 = 更细的增量粒度，
 	// 但单条带过小会损失一点压缩率。
 	Tiles int
+	// TileHeight 是"按目标条带高度算条带数"（像素，对齐到 MCU）。
+	// >0 时优先于 Tiles：分辨率变化时条带数也会跟着变，避免 1080p 与 2K
+	// 共用同一个条带数导致 2K 的每帧重编面积大一倍。
+	//
+	// 为什么按高度而不是按个数：真正决定"光标闪一下要重编多少像素"的是
+	// 条带高度（面积 = 宽 × 高），而条带个数会随分辨率漂移。
+	TileHeight int
 	// Workers 是并行度，<=0 时取 NumCPU。
 	Workers int
 	// Dirty 启用脏条带增量更新。关闭时每帧全量编码（带宽高但实现路径最简单）。
@@ -220,7 +227,14 @@ func (e *Encoder) Reset(w, h int) {
 	e.prev = e.prev[:n]
 	e.havePrev = false
 
-	tileH := (h/e.cfg.Tiles + mcuHeight - 1) / mcuHeight * mcuHeight
+	tiles := e.cfg.Tiles
+	if e.cfg.TileHeight > 0 {
+		tiles = (h + e.cfg.TileHeight - 1) / e.cfg.TileHeight
+		if tiles < 1 {
+			tiles = 1
+		}
+	}
+	tileH := (h/tiles + mcuHeight - 1) / mcuHeight * mcuHeight
 	if tileH < mcuHeight {
 		tileH = mcuHeight
 	}

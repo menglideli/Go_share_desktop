@@ -66,6 +66,9 @@ func main() {
 	// P0-5 的旋钮：多个观众"同一时刻看到同一帧"要付出的固定延迟。
 	// 0 = 关闭同步（回到"收到就显示"，延迟最低但各看各的）。
 	playoutMS := flag.Int("playout", 80, "观看端播放缓冲（毫秒）：多端同步要付出的固定延迟，0 = 关闭同步")
+	// 条带粒度的调优旋钮（默认用档位里的 32px）。调参会直接影响码率与丢包放大，
+	// 用 cmd/tilebench 先量再改：-1 = 档位默认，0 = 按 CPU 核数。
+	tileH := flag.Int("tile-h", -1, "分享端条带高度（像素）：-1 = 档位默认，0 = 按 CPU 核数")
 	flag.Parse()
 
 	if *logPath != "" {
@@ -104,8 +107,9 @@ func main() {
 		keyInterval: *keyInterval, keyBurst: *keyBurst,
 		switchAt: *switchAt, switchRegion: *switchRegion,
 		switchDisp: *switchDisp, displays: ds,
-		disp:     newDispPool(),
+		disp:      newDispPool(),
 		playoutMS: *playoutMS,
+		tileH:     *tileH,
 	}
 	a.clock = &rtc.Clock{}
 	a.pl = newPlayout(a.disp.Recycle())
@@ -326,6 +330,8 @@ type app struct {
 	// ---- P0-5 同步观看 ----
 	// playoutMS 是播放缓冲 D（毫秒，0 = 关闭同步）：所有观众等 `帧 TS + D` 才上屏。
 	playoutMS int
+	// tileH 覆盖档位里的目标条带高度（-1 = 用档位默认，0 = 按 CPU 核数，仅供调参）。
+	tileH int
 	// clock 估计"分享端时钟 - 本端时钟"的偏移（见 internal/rtc/clock.go）。
 	clock *rtc.Clock
 	// pl 是呈现调度器（见 playout.go）。
@@ -479,10 +485,15 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 	a.view = ui.NewView(opts.Display.W, opts.Display.H, fitScale(opts.Display.W, opts.Display.H))
 	a.mu.Unlock()
 
+	preset := pipeline.PresetByName(opts.Preset)
+	if a.tileH >= 0 {
+		// 调参/验证用：把档位里的 32px 覆盖掉（0 = 回到按 CPU 核数分条带）。
+		preset.TileHeight = a.tileH
+	}
 	sh, err := pipeline.NewSharer(shCtx, pipeline.Config{
 		Display: opts.Display,
 		Region:  opts.Region,
-		Preset:  pipeline.PresetByName(opts.Preset),
+		Preset:  preset,
 		Cursor:  true,
 		// 全量帧补帧策略（R32）：接入窗口内密集补 + 稳态靠观众请求。
 		KeyBurst:    a.keyBurst,
