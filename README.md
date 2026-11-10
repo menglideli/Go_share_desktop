@@ -318,7 +318,7 @@ netsh advfirewall firewall add rule name="GoShare-Discovery" dir=in action=allow
 go run ./cmd/capcheck     # 采集链路 12 项：后端选择/DPI/多屏/首帧黑帧预热/区域裁切
 go run ./cmd/codeccheck   # 编解码 15 项：条带并行/增量不漂移/逐通道色彩保真/PSNR
 go run ./cmd/sigcheck     # 信令 29 项：端口顺延/授权码/观众管理/多网卡地址排序
-go run ./cmd/netcheck     # 端到端 25 项：真实 UDP+ICE+DTLS 跑通，含**丢块恢复**、延迟/PSNR、**时钟同步**
+go run ./cmd/netcheck     # 端到端 26 项：真实 UDP+ICE+DTLS 跑通，含**丢块恢复**、延迟/PSNR、**时钟同步**
 go run ./cmd/uicheck      # 界面 13 项：离屏渲染 + -golden 基线逐像素回归（锁屏也能跑）
 go test ./...             # 自适应降档策略、背压阈值、时钟偏移/回绕、呈现时刻换算
 ```

@@ -329,6 +329,9 @@ func main() {
 	// 方向必须与生产一致：观众发 ping、分享端回 pong。
 	runClockSync(viewer, pongs)
 
+	fmt.Printf("\n[6] FEC：大帧按 8 块一组加 XOR 校验，丢一块必须能原地恢复\n")
+	runFEC(sk, host, viewer)
+
 	fmt.Printf("\n------------------------------------------------------------\n")
 	fmt.Printf("结果: %d 通过 / %d 失败\n\n", pass, fail)
 	if fail > 0 {
@@ -468,6 +471,79 @@ func runCase(sk *sink, host, viewer *rtc.Peer, w, h, frames int, dirty bool, pac
 // （拥塞时那一发大概率又丢 → "越要越堵"）。
 // 新实现：每个分块自带帧头 + 完整条带，丢一块只丢它带的那几条带；
 // 修复走"渐进式轮转"，把补齐整屏摊到十几帧里，单帧始终很小。
+// runFEC 验证 P1-7：把一个全量帧按 8 块一组加校验，故意丢组内一块，
+// 观众端应当用校验把它恢复回来 —— 画布完整、且没有额外的"补发请求"。
+func runFEC(sk *sink, host, viewer *rtc.Peer) {
+	const w, h = 1280, 720
+	src := makeFrame(w, h)
+	enc := codec.NewEncoder(codec.Config{Quality: 75, Dirty: true})
+	full, err := enc.Encode(src, w, h)
+	if err != nil {
+		check("FEC 编码", false, err.Error())
+		return
+	}
+	parts := full.Split(codec.MaxChunkPayload)
+	if len(parts) < 4 {
+		check("FEC 分块", false, fmt.Sprintf("只切出 %d 块（<4，不触发 FEC）", len(parts)))
+		return
+	}
+	wire := make([][]byte, 0, len(parts)+1)
+	for _, c := range parts {
+		c.FEC = true
+		b, err := c.Marshal()
+		if err != nil {
+			check("FEC 编码", false, err.Error())
+			return
+		}
+		wire = append(wire, b)
+	}
+	// 取被丢块所在的组，只对这一组算校验（和生产一致：8 块一组）。
+	const groupSize = 8
+	dropIdx := len(wire) / 2
+	g := dropIdx / groupSize
+	start := g * groupSize
+	end := start + groupSize
+	if end > len(wire) {
+		end = len(wire)
+	}
+	group := wire[start:end]
+	par, _ := codec.XORParity(group)
+	lens := make([]uint32, len(group))
+	for i, c := range group {
+		lens[i] = uint32(len(c))
+	}
+	fecMsg := rtc.MarshalFEC(rtc.FECGroup{
+		Seq: full.Seq, TS: uint32(full.TS), Group: uint16(g),
+		DataCount: uint16(len(group)), Lengths: lens, Parity: par,
+	})
+
+	sk.reset(w, h)
+	before := viewer.Stats().FECRecovered
+	for i, c := range wire {
+		if i == dropIdx {
+			continue
+		}
+		_ = sendRetry(host, [][]byte{c})
+	}
+	_ = sendRetry(host, [][]byte{fecMsg})
+
+	// 等画布变完整（恢复块到达后解码器会把它并进画布）。
+	deadline := time.Now().Add(3 * time.Second)
+	var complete bool
+	var missing int
+	for time.Now().Before(deadline) {
+		complete, missing, _, _ = sk.coverState()
+		if complete {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	recovered := viewer.Stats().FECRecovered - before
+	check("FEC 丢一块原地恢复", complete && missing == 0 && recovered >= 1,
+		fmt.Sprintf("丢第 %d/%d 块（组 %d）→ 画布完整=%v 仍缺 %d 条 · 恢复块 %d",
+			dropIdx+1, len(wire), g, complete, missing, recovered))
+}
+
 func runLossRepair(sk *sink, host *rtc.Peer) {
 	const (
 		w, h = 1920, 1080
