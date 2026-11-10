@@ -78,8 +78,16 @@ type Tile struct {
 	Index int
 	Y0    int
 	Y1    int
-	Data  []byte
+	// Enc 是条带编码类型（P2-2）：0 = JPEG，1 = 纯色填充（Data = RGB 3 字节）。
+	// 纯色条带在代码/文档类画面上很常见（空白背景、IDE 装订线），几 KB 直接变 3 字节。
+	Enc  byte
+	Data []byte
 }
+
+const (
+	encJPEG  byte = 0
+	encSolid byte = 1
+)
 
 // Frame 是一帧的编码结果。
 //
@@ -334,6 +342,11 @@ func (e *Encoder) Encode(bgra []byte, w, h int) (*Frame, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			sub := img.SubImage(image.Rect(0, y0, w, y1))
+			// P2-2：整条带同色（空白背景/装订线）就发 3 字节纯色，不必进 JPEG。
+			if r, g, b, ok := solidTile(bgra, w, y0, y1); ok {
+				tiles[k] = Tile{Index: idx, Y0: y0, Y1: y1, Enc: encSolid, Data: []byte{r, g, b}}
+				return
+			}
 			var buf bytes.Buffer
 			// 单条带不会被拆开，所以它超了标称分块大小也只是"自己占一块更大的消息"。
 			// 这里只在它超过**硬上限**（1MB，正常永远到不了）时才降质重编 ——
@@ -512,7 +525,7 @@ func tileChanged(cur, prev []byte, w, h, y0, y1 int) bool {
 // 「双方版本不一致，请把两台机器都升级到同一版本」。
 //
 // 历史：1 = GSJ1（整帧一个消息、按字节切块）；2 = GSJ2（每块自带帧头 + 完整条带）。
-const ProtoVersion = 2
+const ProtoVersion = 3
 
 // ---------------------------------------------------------------------------
 // Wire 格式
@@ -544,7 +557,7 @@ const ProtoVersion = 2
 
 const (
 	frameHeaderLen = 36
-	tileHeaderLen  = 8
+	tileHeaderLen  = 9 // idx(2) y0(2) enc(1) len(4)
 	flagFull       = 1 << 0
 	// flagFEC 表示"这一帧带 FEC 校验块"。旧端不认识这个位，只是忽略（不影响解析）。
 	flagFEC = 1 << 1
@@ -605,7 +618,8 @@ func (f *Frame) Marshal() ([]byte, error) {
 	for _, t := range f.Tiles {
 		binary.BigEndian.PutUint16(buf[off:off+2], uint16(t.Index))
 		binary.BigEndian.PutUint16(buf[off+2:off+4], uint16(t.Y0))
-		binary.BigEndian.PutUint32(buf[off+4:off+8], uint32(len(t.Data)))
+		buf[off+4] = t.Enc
+		binary.BigEndian.PutUint32(buf[off+5:off+9], uint32(len(t.Data)))
 		off += tileHeaderLen
 		copy(buf[off:], t.Data)
 		off += len(t.Data)
@@ -695,7 +709,8 @@ func UnmarshalFrame(buf []byte) (*Frame, error) {
 	for off+tileHeaderLen <= len(buf) {
 		idx := int(binary.BigEndian.Uint16(buf[off : off+2]))
 		y0 := int(binary.BigEndian.Uint16(buf[off+2 : off+4]))
-		n := int(binary.BigEndian.Uint32(buf[off+4 : off+8]))
+		enc := buf[off+4]
+		n := int(binary.BigEndian.Uint32(buf[off+5 : off+9]))
 		off += tileHeaderLen
 		if off+n > len(buf) {
 			return nil, errors.New("codec: 条带长度越界")
@@ -707,7 +722,7 @@ func UnmarshalFrame(buf []byte) (*Frame, error) {
 		if y1 > f.H {
 			y1 = f.H
 		}
-		f.Tiles = append(f.Tiles, Tile{Index: idx, Y0: y0, Y1: y1, Data: data})
+		f.Tiles = append(f.Tiles, Tile{Index: idx, Y0: y0, Y1: y1, Enc: enc, Data: data})
 		f.Bytes += n
 	}
 	f.DirtyTiles = len(f.Tiles)
@@ -858,11 +873,17 @@ func (d *Decoder) DecodeBatch(frames []*Frame) (*image.NRGBA, error) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			img, err := jpeg.Decode(bytes.NewReader(t.Data))
-			if err != nil {
-				return
+			if t.Enc == encSolid {
+				if len(t.Data) >= 3 {
+					fillTile(dst, stride, d.w, t.Data[0], t.Data[1], t.Data[2], t.Y0, t.Y1)
+				}
+			} else {
+				img, err := jpeg.Decode(bytes.NewReader(t.Data))
+				if err != nil {
+					return
+				}
+				writeTile(dst, stride, img, t.Y0, t.Y1, d.workers)
 			}
-			writeTile(dst, stride, img, t.Y0, t.Y1, d.workers)
 			mu.Lock()
 			d.have |= 1 << uint(t.Index)
 			d.curGot |= 1 << uint(t.Index)
@@ -872,6 +893,39 @@ func (d *Decoder) DecodeBatch(frames []*Frame) (*image.NRGBA, error) {
 	wg.Wait()
 	d.DecodeMs = float64(time.Since(t0).Microseconds()) / 1000.0
 	return d.img, nil
+}
+
+// solidTile 判断条带 [y0,y1) 是否整块同色（看源 BGRA，避免 I420 往返误差）。
+func solidTile(bgra []byte, w, y0, y1 int) (r, g, b byte, ok bool) {
+	if w <= 0 || y0 < 0 || y1 <= y0 || y1*w*4 > len(bgra) {
+		return 0, 0, 0, false
+	}
+	base := y0 * w * 4
+	b, g, r = bgra[base], bgra[base+1], bgra[base+2]
+	for y := y0; y < y1; y++ {
+		row := y * w * 4
+		for x := 0; x < w; x++ {
+			i := row + x*4
+			if bgra[i] != b || bgra[i+1] != g || bgra[i+2] != r {
+				return 0, 0, 0, false
+			}
+		}
+	}
+	return r, g, b, true
+}
+
+// fillTile 用纯色填条带行（BGRA 目标，天然不透明）。
+func fillTile(dst []byte, stride, w int, r, g, b byte, y0, y1 int) {
+	if w <= 0 || y1 <= y0 || y1*stride > len(dst) {
+		return
+	}
+	for y := y0; y < y1; y++ {
+		row := y * stride
+		for x := 0; x < w; x++ {
+			i := row + x*4
+			dst[i], dst[i+1], dst[i+2], dst[i+3] = b, g, r, 255
+		}
+	}
 }
 
 // writeTile 把解码出的条带写进画布的 [y0,y1) 行。
