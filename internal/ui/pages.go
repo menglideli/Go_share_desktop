@@ -77,6 +77,13 @@ func (s *Shell) handleEvents(gtx layout.Context) {
 		if s.btnWinRef.Clicked(gtx) {
 			s.RefreshWindows()
 		}
+		if s.btnWinPrev.Clicked(gtx) && s.winPage > 0 {
+			s.winPage--
+		}
+		pages := (len(s.windowRows) + 3) / 4
+		if s.btnWinNext.Clicked(gtx) && s.winPage+1 < pages {
+			s.winPage++
+		}
 		if s.btnStart.Clicked(gtx) {
 			if s.cfg.OnStartShare != nil {
 				err := s.cfg.OnStartShare(ShareOptions{
@@ -422,16 +429,17 @@ func (s *Shell) pageSetup(gtx layout.Context, th *material.Theme) layout.Dimensi
 								l.Color = colDim
 								rows = append(rows, func(gtx layout.Context) layout.Dimensions { return l.Layout(gtx) })
 							} else {
-								// 只显示前 4 个窗口：列表高度固定，窗口化时「开始分享」不会被顶出屏幕。
-								// ⚠️ 不要换成 layout.List —— 实测它在这个嵌套布局里渲染不出按钮，
-								// 而且按钮点不到；直接排 4 行最稳。
-								shown := len(s.windowRows)
-								if shown > 4 {
-									shown = 4
+								// 分页而不是滚动：Gio 的 layout.List 在这个嵌套 section 里实测
+								// 一个元素都不渲染（金标是空框），所以用「每页 4 个 + 翻页」，
+								// 既能看全所有窗口，页面高度也固定。
+								start := s.winPage * 4
+								end := start + 4
+								if end > len(s.windowRows) {
+									end = len(s.windowRows)
 								}
 								rows = append(rows, func(gtx layout.Context) layout.Dimensions {
-									kids := make([]layout.FlexChild, 0, shown*2)
-									for i := 0; i < shown; i++ {
+									kids := make([]layout.FlexChild, 0, (end-start)*2)
+									for i := start; i < end; i++ {
 										i := i
 										if i >= len(s.winBtns) {
 											break
@@ -440,11 +448,10 @@ func (s *Shell) pageSetup(gtx layout.Context, th *material.Theme) layout.Dimensi
 										if len([]rune(label)) > 40 {
 											label = string([]rune(label)[:40]) + "…"
 										}
-										if s.winSel == i {
+										sel := s.winSel == i
+										if sel {
 											label = "✓ " + label
 										}
-										// 用 colBG 做底：区块本身是 colPanel，同色按钮会"看不见"（实测）。
-										sel := s.winSel == i
 										bg, fg := colBG, colText
 										if sel {
 											bg = colAccent
@@ -464,12 +471,36 @@ func (s *Shell) pageSetup(gtx layout.Context, th *material.Theme) layout.Dimensi
 									}
 									return layout.Flex{Axis: layout.Vertical}.Layout(gtx, kids...)
 								})
-								if len(s.windowRows) > shown {
-									n := len(s.windowRows) - shown
+								if pages := (len(s.windowRows) + 3) / 4; pages > 1 {
+									pg := s.winPage + 1
 									rows = append(rows, func(gtx layout.Context) layout.Dimensions {
-										l := material.Caption(th, fmt.Sprintf("另有 %d 个窗口未显示（可用 -window 指定标题）", n))
-										l.Color = colDim
-										return l.Layout(gtx)
+										return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+											layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+												b := material.Button(th, &s.btnWinPrev, "上一页")
+												b.Background = colBG
+												b.Color = colDim
+												b.CornerRadius = unit.Dp(6)
+												b.TextSize = unit.Sp(12)
+												b.Inset = layout.UniformInset(unit.Dp(4))
+												return b.Layout(gtx)
+											}),
+											layout.Rigid(hSpace(8)),
+											layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+												l := material.Caption(th, fmt.Sprintf("第 %d/%d 页", pg, pages))
+												l.Color = colDim
+												return l.Layout(gtx)
+											}),
+											layout.Rigid(hSpace(8)),
+											layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+												b := material.Button(th, &s.btnWinNext, "下一页")
+												b.Background = colBG
+												b.Color = colDim
+												b.CornerRadius = unit.Dp(6)
+												b.TextSize = unit.Sp(12)
+												b.Inset = layout.UniformInset(unit.Dp(4))
+												return b.Layout(gtx)
+											}),
+										)
 									})
 								}
 							}

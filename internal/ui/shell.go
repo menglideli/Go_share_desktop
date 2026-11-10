@@ -220,8 +220,11 @@ type Shell struct {
 	winSel     int
 	winBtns    []widget.Clickable
 	btnWinRef  widget.Clickable
-	// winList 是"跟随窗口"列表的内部滚动区：窗口再多也不能把「开始分享」顶出屏幕。
-	winList widget.List
+	btnWinPrev widget.Clickable
+	btnWinNext widget.Clickable
+	// winPage 是"跟随窗口"的当前页（每页 4 个）：
+	// 窗口再多也不会把「开始分享」顶出屏幕，所有人都能翻到自己的窗口。
+	winPage int
 	// panelList 让分享中面板的"信息区"可滚动：观众一多面板就超高，
 	// 不滚动的话底部的"停止分享"会被推出窗口（实测 780 高窗口 + 2 个观众就放不下）。
 	panelList widget.List
@@ -327,6 +330,7 @@ func (s *Shell) RefreshWindows() {
 	}
 	s.mu.Lock()
 	s.windowRows = rows
+	s.winPage = 0
 	if s.winSel >= len(rows) {
 		s.winSel = -1
 	}

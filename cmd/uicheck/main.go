@@ -274,11 +274,14 @@ func cases() []testCase {
 		{name: "setup", setup: nil},
 		{name: "setup-windows", setup: func(s *ui.Shell) {
 			// P1-2：设置页的"跟随窗口"列表。
-			s.SetWindowsForTest([]ui.WindowRow{
-				{Title: "Visual Studio Code", W: 1600, H: 1000},
-				{Title: "Windows Terminal", W: 1200, H: 800},
-				{Title: "GoShare · 内网桌面共享", W: 1180, H: 780},
-			})
+			var rows []ui.WindowRow
+			names := []string{"Visual Studio Code", "Windows Terminal", "GoShare · 内网桌面共享",
+				"Chrome — GitHub", "WeChat", "Explorer", "Notepad", "Task Manager",
+				"Settings", "Snipping Tool", "Calculator", "Paint"}
+			for i, n := range names {
+				rows = append(rows, ui.WindowRow{Title: n, W: 1600 - i*40, H: 1000 - i*20})
+			}
+			s.SetWindowsForTest(rows)
 		}},
 		{name: "sharing", setup: func(s *ui.Shell) {
 			s.SetShareState(ui.ShareState{
