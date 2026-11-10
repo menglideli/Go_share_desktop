@@ -81,6 +81,9 @@ func main() {
 	// 采集帧率的覆盖项（0 = 按档位自动）。"流畅60"在 1080p 下会真的采集 60fps，
 	// 2K 自动回落 30（编码余量不够）。
 	fps := flag.Int("fps", 0, "采集目标帧率（0 = 按档位自动）")
+	// 兼容性验证用：关掉"能自己合成光标"的能力声明，模拟旧版观看端
+	// （分享端应继续把光标画进帧，画面里仍有光标）。
+	noCursorCap := flag.Bool("no-cursor-cap", false, "观看端：不声明光标能力（模拟旧版，验证兼容）")
 	flag.Parse()
 
 	if *logPath != "" {
@@ -124,6 +127,8 @@ func main() {
 		playoutMS: *playoutMS,
 		tileH:     *tileH,
 		fps:       *fps,
+		cur:       &cursorLayer{},
+		noCursor:  *noCursorCap,
 	}
 	a.clock = &rtc.Clock{}
 	a.pl = newPlayout(a.disp.Recycle())
@@ -145,6 +150,8 @@ func main() {
 		// 观看画面缓冲池的归还通道（见 viewbuf.go）：
 		// 渲染线程换掉上一帧时把缓冲还回来复用，省掉每帧 20MB 的分配。
 		Recycle: a.disp.Recycle(),
+		// 光标独立图层（P0-3）：每帧渲染时问一次"此刻光标在哪"。
+		CursorOverlay: a.cursorOverlay,
 
 		OnStartShare: a.startShare,
 		OnStopShare:  a.stopShare,
@@ -354,6 +361,10 @@ type app struct {
 	tileH int
 	// fps 覆盖采集帧率（0 = 按档位与面积自动，见 pipeline.captureFPSFor）。
 	fps int
+	// cur 是观看端的光标图层状态（P0-3）；分享端不用。
+	cur *cursorLayer
+	// noCursor 关闭"光标能力"声明（-no-cursor-cap，模拟旧版观看端）。
+	noCursor bool
 	// clock 估计"分享端时钟 - 本端时钟"的偏移（见 internal/rtc/clock.go）。
 	clock *rtc.Clock
 	// pl 是呈现调度器（见 playout.go）。
@@ -661,6 +672,12 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 					// 分享端的观众列表据此标出掉队者（P0-5 的可观测性）。
 					if st, ok := parseViewerStat(payload); ok {
 						a.setViewerStat(req.Token, st)
+					}
+				case rtc.CtlHello:
+					// 观众声明能力。声明了"能自己合成光标"的观众，
+					// 分享端就可以停止把光标画进帧，改走 ctl 光标流（P0-3）。
+					if hi, ok := rtc.ParseHello(payload); ok && hi.Cursor && peer != nil {
+						sh.SetPeerCursorCap(peer, true)
 					}
 				}
 			},
@@ -1266,15 +1283,23 @@ func (a *app) dialOnce(dec *codec.Decoder, addr, code string) (*signal.Session, 
 			// 时钟同步的另一半：分享端回的 pong 在这里换算成"分享端 - 本端"的偏移。
 			// 它跑在 ctl 的读 goroutine 上，只做一次算术 + 加锁，不能做重活。
 			OnControl: func(t rtc.CtlType, payload []byte) {
-				if t != rtc.CtlTimePong {
-					return
+				switch t {
+				case rtc.CtlTimePong:
+					t0, t1, t2, _, ok := rtc.ParseTimePayload(payload)
+					if !ok {
+						return
+					}
+					a.clock.Observe(t0, t1, t2, uint32(time.Now().UnixMilli()))
+					a.wSyncRTT.Store(int64(a.clock.RTT()))
+				case rtc.CtlCursorShape:
+					if sh, ok := rtc.ParseCursorShape(payload); ok {
+						a.cur.setShape(sh)
+					}
+				case rtc.CtlCursorPos:
+					if p, ok := rtc.ParseCursorPos(payload); ok {
+						a.cur.addPos(p)
+					}
 				}
-				t0, t1, t2, _, ok := rtc.ParseTimePayload(payload)
-				if !ok {
-					return
-				}
-				a.clock.Observe(t0, t1, t2, uint32(time.Now().UnixMilli()))
-				a.wSyncRTT.Store(int64(a.clock.RTT()))
 			},
 			// 丢掉一块 = 它带的条带更新永远没了（增量帧不会重发）。
 			// 必须让状态循环去要对端开一轮修复，否则就是"永久缺一块"（R32 同类）。
@@ -1427,6 +1452,13 @@ func (a *app) dialOnce(dec *codec.Decoder, addr, code string) (*signal.Session, 
 	}
 	// Dial 内部才创建 peer，回调里拿不到，只能先装箱再交给 OnFrame。
 	a.peerBox.Store(sess.Peer)
+	// 声明能力：本端能自己合成光标。分享端收到后才会停止把光标画进帧（P0-3）；
+	// 发失败也不要紧 —— 那就退回"光标画在帧里"的旧行为，不是错误。
+	if !a.noCursor {
+		if err := sess.Peer.SendControl(rtc.CtlHello, rtc.MarshalHello(rtc.HelloInfo{Cursor: true})); err != nil {
+			log.Printf("声明光标能力失败（退回帧内光标）：%v", err)
+		}
+	}
 	return sess, nil
 }
 
@@ -1607,11 +1639,11 @@ func (a *app) watchStatusLoop(dec *codec.Decoder) {
 			if batches > 0 {
 				avgBatch = float64(chunks) / float64(batches)
 			}
-			log.Printf("观看统计：%s · 非黑 %.1f%% · 亮度 %.1f · 已收 %d 帧/%d 块（均 %.1f 块/批）· 解码跳块 %d · 坏块 %d · 画布完整=%v · 缓冲池 空闲%d/持有%d/兜底累计%d · 上屏 #%d 晚 %dms · 同步 %+dms(rtt %dms) · 播放队列丢弃 %d",
+			log.Printf("观看统计：%s · 非黑 %.1f%% · 亮度 %.1f · 已收 %d 帧/%d 块（均 %.1f 块/批）· 解码跳块 %d · 坏块 %d · 画布完整=%v · 缓冲池 空闲%d/持有%d/兜底累计%d · 上屏 #%d 晚 %dms · 同步 %+dms(rtt %dms) · 播放队列丢弃 %d · %s",
 				st, nb*100, lum, fr, chunks, avgBatch, a.wSkipped.Load(), ps.BadChunks, !a.needFull.Load(),
 				freeN, heldN, missN, a.wDispSeq.Load(), a.wDispLate.Load(),
 				func() int32 { o, _ := a.clock.Offset(); return o }(), a.wSyncRTT.Load(),
-				a.pl.dropped.Load())
+				a.pl.dropped.Load(), a.cur.summary())
 		}
 	}
 }

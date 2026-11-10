@@ -199,6 +199,9 @@ type peerSlot struct {
 	wake chan struct{} // cap 1：新帧到达信号（多次发布会聚合，读时总是取最新）
 	done chan struct{} // 关闭即让发送 goroutine 退出
 	once sync.Once     // done 只关一次
+	// cursor 表示该观众声明了"能自己合成光标"（CtlHello）。它决定分享端
+	// 是否把光标画进帧 —— 只要有一个观众没声明，就必须继续画（P0-3）。
+	cursor bool
 }
 
 // Sharer 是一条分享管线：单采集、单编码、扇出给多个观众。
@@ -221,6 +224,9 @@ type Sharer struct {
 	stats Stats
 	// curDisplay 是当前采集的显示器（SetRegion 重算帧率要用它的尺寸）。
 	curDisplay capture.Display
+	// cursorOn 为 true 表示"所有观众都能自己合成光标"，此时不再画进帧，
+	// 改走 ctl 的 60Hz 光标流（见 cursorLoop）。
+	cursorOn atomic.Bool
 	// latest 是扇出共享缓存：最近一帧的线格式数据（见 wireFrame 注释）。
 	latest atomic.Pointer[wireFrame]
 	// wantKey 表示下一位观众（或全部观众）需要全量帧
@@ -591,6 +597,8 @@ func (s *Sharer) rebuildSource(d capture.Display, r capture.Rect, fps int) error
 	// 尺寸大概率变了：全量帧让观众画布整体重建，避免 dirty 增量只盖一部分（R32 同类）。
 	s.enc.ForceKeyFrame()
 	s.fps.Store(int32(fps))
+	// 新源的"画光标"默认值是 opt.Cursor（true）；按当前观众能力重新落一次。
+	s.applyCursorMode()
 	if oldFPS != fps {
 		log.Printf("采集帧率 %d → %d fps（面积变化）", oldFPS, fps)
 	}
@@ -620,6 +628,8 @@ func (s *Sharer) AddPeer(p *rtc.Peer) {
 	s.adaptMu.Unlock()
 	s.RequestRepair()
 	go s.sendLoop(p, slot)
+	// 新观众默认"还没有能力信息"→ 继续把光标画进帧，等它发 CtlHello。
+	s.updateCursorMode()
 }
 
 // RemovePeer 移除观众。
@@ -630,6 +640,151 @@ func (s *Sharer) RemovePeer(p *rtc.Peer) {
 	s.mu.Unlock()
 	if ok {
 		slot.once.Do(func() { close(slot.done) })
+	}
+	// 走掉的可能正是最后一位旧观众：此时可以切到"光标走 ctl"的模式。
+	s.updateCursorMode()
+}
+
+// SetPeerCursorCap 记录某位观众是否声明了"能自己合成光标"（CtlHello）。
+func (s *Sharer) SetPeerCursorCap(p *rtc.Peer, on bool) {
+	s.mu.Lock()
+	slot, ok := s.peers[p]
+	if ok && slot.cursor != on {
+		slot.cursor = on
+	}
+	s.mu.Unlock()
+	if ok {
+		s.updateCursorMode()
+	}
+}
+
+// updateCursorMode 重新判断"要不要把光标画进帧"。
+//
+// 规则：**只有当所有观众都声明了能力**时才关掉画进帧，改为走 ctl 光标流。
+// 只要有一个旧观众端（或还没发 Hello 的新观众），就继续画进帧 ——
+// 宁可让新观众短暂看到"帧内光标 + 自己的合成光标"，也不能让旧观众端没有光标。
+func (s *Sharer) updateCursorMode() {
+	s.mu.Lock()
+	total := len(s.peers)
+	capable := 0
+	for _, slot := range s.peers {
+		if slot.cursor {
+			capable++
+		}
+	}
+	s.mu.Unlock()
+
+	on := total > 0 && capable == total
+	if prev := s.cursorOn.Swap(on); prev != on {
+		log.Printf("光标独立传输：%v（%d/%d 位观众能自己合成）", on, capable, total)
+	}
+	s.applyCursorMode()
+}
+
+// applyCursorMode 把 cursorOn 落到当前的采集源上（重建源之后也要调用）。
+func (s *Sharer) applyCursorMode() {
+	if src := s.src.Load(); src != nil {
+		src.SetDrawCursor(!s.cursorOn.Load())
+	}
+}
+
+// cursorPeers 取"声明了光标能力"的观众快照（不要在持锁时发消息）。
+func (s *Sharer) cursorPeers() []*rtc.Peer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*rtc.Peer, 0, len(s.peers))
+	for p, slot := range s.peers {
+		if slot.cursor {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// CursorStreaming 报告当前是否在走"光标独立传输"。
+func (s *Sharer) CursorStreaming() bool { return s.cursorOn.Load() }
+
+// cursorLoop 以 ~60Hz 发光标位置（形状变化时补发位图）。
+//
+// 为什么必须独立于帧循环：桌面静止时 DXGI 不出帧，而鼠标还在动。
+// 60Hz × 25 字节 ≈ 12 kbps，相比"每帧重编一条 32px 横带（2.6~3.6 Mbps）"
+// 低了三个数量级。
+func (s *Sharer) cursorLoop(ctx context.Context) {
+	t := time.NewTicker(16 * time.Millisecond)
+	defer t.Stop()
+	const shapeResend = 2 * time.Second
+
+	var (
+		lastHandle  uint64 = ^uint64(0)
+		curShape    rtc.CursorShape
+		haveShape   bool
+		lastShapeAt time.Time
+		lastHidden  bool
+	)
+	sendShape := func(peers []*rtc.Peer) {
+		msg := rtc.MarshalCursorShape(curShape)
+		lastShapeAt = time.Now()
+		for _, p := range peers {
+			_ = p.SendControl(rtc.CtlCursorShape, msg)
+		}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if !s.cursorOn.Load() {
+			continue
+		}
+		src := s.src.Load()
+		if src == nil {
+			continue
+		}
+		peers := s.cursorPeers()
+		if len(peers) == 0 {
+			continue
+		}
+		x, y, vis := capture.CursorPos()
+		h := uint64(capture.CursorHandle())
+		// 形状变化才解码位图（解码要读 GDI 位图，不能 60Hz 做）。
+		if vis && h != lastHandle {
+			lastHandle = h
+			if id, w, hh, hotX, hotY, pix, ok := capture.CursorBitmap(); ok && w > 0 && hh > 0 {
+				curShape = rtc.CursorShape{ID: id, W: w, H: hh, HotX: hotX, HotY: hotY, Pix: pix}
+				haveShape = true
+				sendShape(peers) // 形状立刻发；观看端按 id 缓存
+			}
+		}
+		// 周期性重发：中途接入的观众端不需要额外的"请求形状"消息。
+		if haveShape && time.Since(lastShapeAt) >= shapeResend {
+			sendShape(peers)
+		}
+		if !vis {
+			if lastHidden {
+				continue
+			}
+			lastHidden = true
+		} else {
+			lastHidden = false
+		}
+		r := src.Region()
+		s.mu.Lock()
+		d := s.curDisplay
+		s.mu.Unlock()
+		pos := rtc.CursorPos{
+			TS:  uint32(time.Now().UnixMilli()),
+			ID:  curShape.ID,
+			X:   int32(x),
+			Y:   int32(y),
+			RX:  int32(d.X + r.X),
+			RY:  int32(d.Y + r.Y),
+			Vis: vis && haveShape,
+		}
+		msg := rtc.MarshalCursorPos(pos)
+		for _, p := range peers {
+			_ = p.SendControl(rtc.CtlCursorPos, msg)
+		}
 	}
 }
 
@@ -884,6 +1039,8 @@ func (s *Sharer) Run(ctx context.Context) error {
 	if !s.cfg.AdaptiveOff {
 		go s.adaptLoop(ctx)
 	}
+	// 光标流：静止桌面时媒体通道不产帧，鼠标位置只能靠这条 60Hz 的 ctl 通道。
+	go s.cursorLoop(ctx)
 	lastSend := time.Time{}
 	lastBeat := time.Now()
 	lastPauseEmit := time.Time{}

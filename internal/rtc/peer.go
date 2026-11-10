@@ -503,6 +503,12 @@ const (
 	// CtlTimePong 分享端 → 观众：带回 t0，并填上 t1（收到）与 t2（回复）。
 	// 观众收到时补上 t3，就能算出"分享端时钟 - 本端时钟"的偏移（见 clockSync）。
 	CtlTimePong CtlType = 7
+	// CtlCursorShape 分享端 → 观众：一个可缓存的鼠标光标位图（P0-3）。
+	// 只在形状变化时发；观看端按 ID 缓存（见 cursor.go）。
+	CtlCursorShape CtlType = 8
+	// CtlCursorPos 分享端 → 观众：光标位置采样（60Hz，25 字节）。
+	// 它是"静止桌面也能看到鼠标动"的唯一来源 —— 媒体通道此时根本不产帧。
+	CtlCursorPos CtlType = 9
 )
 
 // TimePayload 把四个毫秒时间戳编码成 ctl 的 16 字节 payload。

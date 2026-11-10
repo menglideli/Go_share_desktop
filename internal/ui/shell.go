@@ -138,6 +138,11 @@ type ShellConfig struct {
 	// nil 表示不复用（离屏校验等场景直接交给 GC）。
 	Recycle chan<- *image.NRGBA
 
+	// CursorOverlay 返回"此刻该叠加的光标"（P0-3）：位图 + 图像坐标（左上角，
+	// 已扣掉热点）+ 是否可见。图像坐标相对于当前显示的帧（原始像素）。
+	// 每帧渲染都会调用；返回 nil/false 表示不画。
+	CursorOverlay func() (img *image.NRGBA, pt image.Point, ok bool)
+
 	// ExitAfter 大于 0 时到时自动退出（自动化验证用）。
 	ExitAfter time.Duration
 }
@@ -153,10 +158,10 @@ type ShareOptions struct {
 type Shell struct {
 	cfg ShellConfig
 
-	mu     sync.Mutex
-	share  ShareState
-	join   JoinState
-	route  Route
+	mu    sync.Mutex
+	share ShareState
+	join  JoinState
+	route Route
 	// closeFn 是 Run 里创建的唯一关窗路径（CAS 幂等），
 	// 供窗口外的触发源调用 —— 目前只有托盘「退出」。
 	// atomic.Value 存 func(string)；Run 启动时装填。
@@ -239,7 +244,7 @@ type Shell struct {
 // NewShell 创建外壳。displays 为空时调用方应先报错。
 func NewShell(cfg ShellConfig) *Shell {
 	s := &Shell{
-		cfg:          cfg,
+		cfg: cfg,
 		// ⚠️ 容量只能是 1：观看画面是"最新优先"，通道里压着的都是过期帧。
 		// 更深还会**抽干画面缓冲池** —— 池子总共 3 块，界面同时占着
 		// lastFrame(1) + 通道(2) 就没有余量给解码侧了（实测：池子用尽 → 走整帧
@@ -388,6 +393,12 @@ func (s *Shell) SetDragPreview(from, to image.Point) {
 func (s *Shell) SetZoom100(on bool) {
 	s.zoom100 = on
 	s.panX, s.panY = 0, 0
+}
+
+// SetCursorOverlay 覆盖光标叠加回调（离屏校验用；生产由 ShellConfig 提供）。
+// 必须在开始渲染之前调用。
+func (s *Shell) SetCursorOverlay(cb func() (*image.NRGBA, image.Point, bool)) {
+	s.cfg.CursorOverlay = cb
 }
 
 // SetSetupNote 设置设置页提示（如"已选择区域 800×600"）。

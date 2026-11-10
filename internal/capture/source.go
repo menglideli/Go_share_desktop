@@ -3,6 +3,7 @@ package capture
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-mswin/screencapture"
@@ -53,9 +54,9 @@ func (f Frame) Clone() Frame {
 // Options 描述一次采集会话。
 type Options struct {
 	Display Display
-	Region  Rect  // 相对显示器左上角的物理像素区域；为空则整屏
-	FPS     int   // 目标帧率，0 表示用库默认值
-	Cursor  bool  // 是否叠加鼠标光标（自绘，不走库选项）
+	Region  Rect // 相对显示器左上角的物理像素区域；为空则整屏
+	FPS     int  // 目标帧率，0 表示用库默认值
+	Cursor  bool // 是否叠加鼠标光标（自绘，不走库选项）
 }
 
 // Source 是一个采集会话。非并发安全：同一时刻只能有一个 goroutine 取帧。
@@ -78,6 +79,9 @@ type Source struct {
 	// warm 为 true 时表示处于预热期（Warmup）：此间的黑帧不写入 last，
 	// 免得"桌面静止 + 首帧黑"时把一帧黑永久留给观众。见 warmup.go。
 	warm bool
+	// drawCursor 决定是否把光标画进帧（P0-3：所有观众都能自己合成时关掉，
+	// 改成走 ctl 的光标流；原子量是为了 ctl 回调线程能改、采集线程能读）。
+	drawCursor atomic.Bool
 }
 
 // NewSource 启动采集。region 为空时采集整个显示器。
@@ -99,8 +103,18 @@ func NewSource(ctx context.Context, opt Options) (*Source, error) {
 		bufs:    [2][]byte{make([]byte, region.W*region.H*4), make([]byte, region.W*region.H*4)},
 		started: time.Now(),
 	}
+	s.drawCursor.Store(opt.Cursor)
 	return s, nil
 }
+
+// SetDrawCursor 切换"是否把光标画进帧"（P0-3）。
+//
+// 关掉的前提是：当前所有观众都能自己合成光标（发来了 CtlHello）。
+// 有任何一个旧观众端时都要保持打开 —— 否则他们看到的画面里没有光标。
+func (s *Source) SetDrawCursor(on bool) { s.drawCursor.Store(on) }
+
+// DrawCursor 报告当前是否把光标画进帧。
+func (s *Source) DrawCursor() bool { return s.drawCursor.Load() }
 
 // Region 返回实际生效的采集区域（已 clamp 与偶数对齐）。
 func (s *Source) Region() Rect { return s.region }
@@ -217,7 +231,7 @@ func (s *Source) WaitFrame(ctx context.Context) (Frame, error) {
 		TS:  time.Now(),
 	}
 
-	if s.opt.Cursor {
+	if s.drawCursor.Load() {
 		// 光标位置换算：区域左上角对应的虚拟屏幕坐标
 		originX := s.opt.Display.X + region.X
 		originY := s.opt.Display.Y + region.Y

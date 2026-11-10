@@ -128,6 +128,25 @@ func main() {
 				lbl, ln, labelOff, centered)
 		}
 
+		// P0-3 光标层：光标左上角必须落在画面左上角，尺寸随画面缩放。
+		if c.name == "viewing-cursor" || c.name == "viewing-cursor-175" {
+			fb, fn := colorBounds(img, 1, 254, 3, 2)   // 画面（唯一色）
+			cb, cn := colorBounds(img, 255, 0, 255, 2) // 光标（品红）
+			dx, dy := cb.Min.X-fb.Min.X, cb.Min.Y-fb.Min.Y
+			okc := fn > 1000 && cn > 50 && absi(dx) <= 2 && absi(dy) <= 2
+			if fb.Dx() > 0 {
+				exp := 16 * fb.Dx() / 960 // 960 是合成画面的宽度
+				if absi(cb.Dx()-exp) > 2 {
+					okc = false
+				}
+			}
+			if !okc {
+				ok = false
+			}
+			detail += fmt.Sprintf(" · 光标落点偏差 (%d,%d)px 尺寸 %dx%d 画面 %v",
+				dx, dy, cb.Dx(), cb.Dy(), fb)
+		}
+
 		// 判据二（R31）：与基线图逐像素比对。
 		// 判据一太粗 —— R30 那种"按钮整列消失"只改动 2~4% 的像素，
 		// 非黑/色数/亮部三项几乎不动，粗判据照样 8/8 通过。必须逐像素兜住。
@@ -181,7 +200,7 @@ func cropCenter(img *image.RGBA, w, h int) *image.RGBA {
 
 // diffResult 是两张图的像素差异。
 type diffResult struct {
-	pct float64      // 差异像素占比（%）
+	pct float64         // 差异像素占比（%）
 	box image.Rectangle // 差异包围盒
 }
 
@@ -312,6 +331,24 @@ func cases() []testCase {
 			s.SetJoinState(ui.JoinState{Status: "DESKTOP-EXAMPLE · 29.4 fps · 7.1 Mbps · 解码 4.9 ms"})
 			s.SetLastFrame(synth(960, 540))
 		}},
+		{name: "viewing-cursor", setup: func(s *ui.Shell) {
+			// P0-3：光标独立图层。画面用"唯一色"填充以便从渲染结果里认出它的矩形；
+			// 光标放在画面左上角 (0,0)，断言它落在画面左上角、且尺寸随画面缩放。
+			s.SetJoinState(ui.JoinState{Status: "DESKTOP-EXAMPLE · 29.4 fps · 7.1 Mbps"})
+			s.SetLastFrame(solidFrame(960, 540))
+			s.SetCursorOverlay(func() (*image.NRGBA, image.Point, bool) {
+				return magentaCursor(), image.Pt(0, 0), true
+			})
+		}},
+		{name: "viewing-cursor-175", setup: func(s *ui.Shell) {
+			// 同一份内容在 175% 缩放下渲染：物理像素结果必须与 1.0 一致，
+			// 用来钉住"光标坐标与 widget.Image 的 Scale=1/PxPerDp 是同一套单位"。
+			s.SetJoinState(ui.JoinState{Status: "DESKTOP-EXAMPLE · 29.4 fps · 7.1 Mbps"})
+			s.SetLastFrame(solidFrame(960, 540))
+			s.SetCursorOverlay(func() (*image.NRGBA, image.Point, bool) {
+				return magentaCursor(), image.Pt(0, 0), true
+			})
+		}},
 		{name: "viewing-zoom", setup: func(s *ui.Shell) {
 			s.SetJoinState(ui.JoinState{Status: "DESKTOP-EXAMPLE · 29.4 fps · 7.1 Mbps · 解码 4.9 ms"})
 			// 1:1 模式：画面比窗口大（只显示局部、可平移），原始像素不缩放
@@ -387,6 +424,30 @@ func lightBoundsIn(img *image.RGBA, r image.Rectangle) (image.Rectangle, int) {
 	return box, n
 }
 
+// colorBounds 找指定颜色（±tol）的像素包围盒，用于"合成结果落在哪"的断言。
+func colorBounds(img *image.RGBA, r0, g0, b0 uint8, tol int) (image.Rectangle, int) {
+	b := img.Bounds()
+	var box image.Rectangle
+	n := 0
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			i := y*img.Stride + x*4
+			if absi(int(img.Pix[i])-int(r0)) <= tol &&
+				absi(int(img.Pix[i+1])-int(g0)) <= tol &&
+				absi(int(img.Pix[i+2])-int(b0)) <= tol {
+				n++
+				r := image.Rect(x, y, x+1, y+1)
+				if n == 1 {
+					box = r
+				} else {
+					box = box.Union(r)
+				}
+			}
+		}
+	}
+	return box, n
+}
+
 // redBounds 找「停止」按钮的纯红区块（colBad = 224,82,82，不透明），
 // 返回包围盒与像素数 —— 用来断言"按钮没有被窗口裁掉"。
 func redBounds(img *image.RGBA) (image.Rectangle, int) {
@@ -423,6 +484,13 @@ func render(win *headless.Window, th *material.Theme, w, h int, name string, set
 		Constraints: layout.Exact(image.Pt(w, h)),
 		Now:         time.Now(),
 		Source:      r.Source(),
+	}
+
+	// 175% 缩放的光标用例：约束按 dp 给（物理像素仍是 w×h），
+	// 用来验证"光标坐标与 widget.Image 的 Scale=1/PxPerDp 是同一套单位"。
+	if name == "viewing-cursor-175" {
+		gtx.Metric = unit.Metric{PxPerDp: 1.75, PxPerSp: 1.75}
+		gtx.Constraints = layout.Exact(image.Pt(int(float64(w)/1.75), int(float64(h)/1.75)))
 	}
 
 	// HUD 不进主壳路由（它是独立置顶窗口），单独走一条渲染路径：
@@ -477,7 +545,7 @@ func routeOf(name string) ui.Route {
 		return ui.RouteSharing
 	case "join", "join-error":
 		return ui.RouteJoin
-	case "viewing", "viewing-zoom":
+	case "viewing", "viewing-zoom", "viewing-cursor", "viewing-cursor-175":
 		return ui.RouteViewing
 	case "region":
 		return ui.RouteRegion
@@ -495,6 +563,24 @@ func fakeDisplays() []capture.Display {
 
 // synth 造一张结构化测试图（渐变 + 色块 + 网格），用作"画面"。
 // 不用随机噪声：JPEG/压缩类统计对噪声没意义，且视觉上无法分辨内容是否真的画出来。
+// solidFrame 造一张"唯一色"画面：便于从渲染结果里认出画面矩形。
+func solidFrame(w, h int) *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for i := 0; i < len(img.Pix); i += 4 {
+		img.Pix[i], img.Pix[i+1], img.Pix[i+2], img.Pix[i+3] = 1, 254, 3, 255
+	}
+	return img
+}
+
+// magentaCursor 造 16×16 品红光标（UI 里不会出现这个颜色）。
+func magentaCursor() *image.NRGBA {
+	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
+	for i := 0; i < len(img.Pix); i += 4 {
+		img.Pix[i], img.Pix[i+1], img.Pix[i+2], img.Pix[i+3] = 255, 0, 255, 255
+	}
+	return img
+}
+
 func synth(w, h int) *image.NRGBA {
 	img := image.NewNRGBA(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {

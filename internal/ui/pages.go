@@ -18,8 +18,8 @@ import (
 	"gioui.org/widget"
 	"gioui.org/widget/material"
 
-	sysclip "goshare/internal/clip"
 	"goshare/internal/capture"
+	sysclip "goshare/internal/clip"
 )
 
 // ---------------------------------------------------------------------------
@@ -46,10 +46,10 @@ func (s *Shell) handleEvents(gtx layout.Context) {
 				_ = i
 			}
 		}
-	if s.btnPick.Clicked(gtx) {
-		if s.cfg.OnPickRegion != nil {
-			s.regionReturn = RouteSetup
-			snap := s.cfg.OnPickRegion(s.selDisplay)
+		if s.btnPick.Clicked(gtx) {
+			if s.cfg.OnPickRegion != nil {
+				s.regionReturn = RouteSetup
+				snap := s.cfg.OnPickRegion(s.selDisplay)
 				if snap == nil {
 					s.Toast("抓取桌面快照失败")
 				} else {
@@ -539,131 +539,131 @@ func (s *Shell) pageSharing(gtx layout.Context, th *material.Theme) layout.Dimen
 					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 						return s.panelList.Layout(gtx, 1, func(gtx layout.Context, _ int) layout.Dimensions {
 							return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-					// 授权码
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return s.section(gtx, th, "授权码", func(gtx layout.Context) layout.Dimensions {
-							return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-								layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-									l := material.H4(th, st.Code)
-									l.Color = colGood
-									return l.Layout(gtx)
-								}),
+								// 授权码
 								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									b := material.Button(th, &s.btnCodeCopy, "复制")
-									b.Background = colAccent
-									b.Color = color.NRGBA{R: 255, G: 255, B: 255, A: 255}
-									b.CornerRadius = unit.Dp(8)
-									return b.Layout(gtx)
+									return s.section(gtx, th, "授权码", func(gtx layout.Context) layout.Dimensions {
+										return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+											layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+												l := material.H4(th, st.Code)
+												l.Color = colGood
+												return l.Layout(gtx)
+											}),
+											layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+												b := material.Button(th, &s.btnCodeCopy, "复制")
+												b.Background = colAccent
+												b.Color = color.NRGBA{R: 255, G: 255, B: 255, A: 255}
+												b.CornerRadius = unit.Dp(8)
+												return b.Layout(gtx)
+											}),
+										)
+									})
 								}),
-							)
-						})
-					}),
-					layout.Rigid(vSpace(12)),
-					// 地址列表
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return s.section(gtx, th, "连接地址（同事用其中一个）", func(gtx layout.Context) layout.Dimensions {
-							children := make([]layout.FlexChild, 0, len(st.Addrs)*2)
-							for i, a := range st.Addrs {
-								i, a := i, a
-								children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-										layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-											l := material.Body2(th, a)
-											l.Color = colText
+								layout.Rigid(vSpace(12)),
+								// 地址列表
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									return s.section(gtx, th, "连接地址（同事用其中一个）", func(gtx layout.Context) layout.Dimensions {
+										children := make([]layout.FlexChild, 0, len(st.Addrs)*2)
+										for i, a := range st.Addrs {
+											i, a := i, a
+											children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+												return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+													layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+														l := material.Body2(th, a)
+														l.Color = colText
+														return l.Layout(gtx)
+													}),
+													layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+														if i >= len(s.addrCopies) {
+															return layout.Dimensions{}
+														}
+														b := material.Button(th, &s.addrCopies[i], "复制")
+														b.Background = colBG
+														b.Color = colText
+														b.CornerRadius = unit.Dp(6)
+														b.TextSize = unit.Sp(12)
+														b.Inset = layout.UniformInset(unit.Dp(4))
+														return b.Layout(gtx)
+													}),
+												)
+											}))
+											children = append(children, layout.Rigid(vSpace(6)))
+										}
+										if len(children) == 0 {
+											l := material.Body2(th, "（无可用地址）")
+											l.Color = colDim
 											return l.Layout(gtx)
-										}),
-										layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-											if i >= len(s.addrCopies) {
-												return layout.Dimensions{}
-											}
-											b := material.Button(th, &s.addrCopies[i], "复制")
-											b.Background = colBG
-											b.Color = colText
-											b.CornerRadius = unit.Dp(6)
-											b.TextSize = unit.Sp(12)
-											b.Inset = layout.UniformInset(unit.Dp(4))
-											return b.Layout(gtx)
-										}),
-									)
-								}))
-								children = append(children, layout.Rigid(vSpace(6)))
-							}
-							if len(children) == 0 {
-								l := material.Body2(th, "（无可用地址）")
-								l.Color = colDim
-								return l.Layout(gtx)
-							}
-							return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
-						})
-					}),
-					layout.Rigid(vSpace(12)),
-					// HUD
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return s.section(gtx, th, "运行状态", func(gtx layout.Context) layout.Dimensions {
-							l := material.Body2(th, st.HUD)
-							l.Color = colText
-							return l.Layout(gtx)
-						})
-					}),
-					layout.Rigid(vSpace(12)),
-					// 质量
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return s.section(gtx, th, "画质与帧率", func(gtx layout.Context) layout.Dimensions {
-							return s.presetRow(gtx, th)
-						})
-					}),
-					layout.Rigid(vSpace(12)),
-					// 观众列表
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return s.section(gtx, th, fmt.Sprintf("观众（%d 人）", len(st.Viewers)), func(gtx layout.Context) layout.Dimensions {
-							if len(st.Viewers) == 0 {
-								l := material.Body2(th, "暂无观众")
-								l.Color = colDim
-								return l.Layout(gtx)
-							}
-							children := make([]layout.FlexChild, 0, len(st.Viewers)*2)
-							for i, v := range st.Viewers {
-								i, v := i, v
-								children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-										layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-											d := time.Since(v.Since).Truncate(time.Second)
-											txt := fmt.Sprintf("%s · %v", v.Name, d)
-											col := colText
-											if v.SyncKnown {
-												// 同步状态（P0-5）：显示帧号让"多端是否在同一帧"肉眼可查；
-												// 落后超过 200ms 标黄，掉队者一眼看到。
-												txt = fmt.Sprintf("%s · %v · #%d", v.Name, d, v.Seq)
-												if v.BehindMS > 0 {
-													txt += fmt.Sprintf(" 落后 %d ms", v.BehindMS)
-												}
-												if v.BehindMS > 200 || v.LateMS > 200 {
-													col = colWarn
-												}
-											}
-											l := material.Body2(th, txt)
-											l.Color = col
+										}
+										return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+									})
+								}),
+								layout.Rigid(vSpace(12)),
+								// HUD
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									return s.section(gtx, th, "运行状态", func(gtx layout.Context) layout.Dimensions {
+										l := material.Body2(th, st.HUD)
+										l.Color = colText
+										return l.Layout(gtx)
+									})
+								}),
+								layout.Rigid(vSpace(12)),
+								// 质量
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									return s.section(gtx, th, "画质与帧率", func(gtx layout.Context) layout.Dimensions {
+										return s.presetRow(gtx, th)
+									})
+								}),
+								layout.Rigid(vSpace(12)),
+								// 观众列表
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									return s.section(gtx, th, fmt.Sprintf("观众（%d 人）", len(st.Viewers)), func(gtx layout.Context) layout.Dimensions {
+										if len(st.Viewers) == 0 {
+											l := material.Body2(th, "暂无观众")
+											l.Color = colDim
 											return l.Layout(gtx)
-										}),
-										layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-											if i >= len(s.kickBtns) {
-												return layout.Dimensions{}
-											}
-											b := material.Button(th, &s.kickBtns[i], "断开")
-											b.Background = colBG
-											b.Color = colWarn
-											b.CornerRadius = unit.Dp(6)
-											b.TextSize = unit.Sp(12)
-											b.Inset = layout.UniformInset(unit.Dp(4))
-											return b.Layout(gtx)
-										}),
-									)
-								}))
-								children = append(children, layout.Rigid(vSpace(6)))
-							}
-							return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
-						})
-					}),
+										}
+										children := make([]layout.FlexChild, 0, len(st.Viewers)*2)
+										for i, v := range st.Viewers {
+											i, v := i, v
+											children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+												return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+													layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+														d := time.Since(v.Since).Truncate(time.Second)
+														txt := fmt.Sprintf("%s · %v", v.Name, d)
+														col := colText
+														if v.SyncKnown {
+															// 同步状态（P0-5）：显示帧号让"多端是否在同一帧"肉眼可查；
+															// 落后超过 200ms 标黄，掉队者一眼看到。
+															txt = fmt.Sprintf("%s · %v · #%d", v.Name, d, v.Seq)
+															if v.BehindMS > 0 {
+																txt += fmt.Sprintf(" 落后 %d ms", v.BehindMS)
+															}
+															if v.BehindMS > 200 || v.LateMS > 200 {
+																col = colWarn
+															}
+														}
+														l := material.Body2(th, txt)
+														l.Color = col
+														return l.Layout(gtx)
+													}),
+													layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+														if i >= len(s.kickBtns) {
+															return layout.Dimensions{}
+														}
+														b := material.Button(th, &s.kickBtns[i], "断开")
+														b.Background = colBG
+														b.Color = colWarn
+														b.CornerRadius = unit.Dp(6)
+														b.TextSize = unit.Sp(12)
+														b.Inset = layout.UniformInset(unit.Dp(4))
+														return b.Layout(gtx)
+													}),
+												)
+											}))
+											children = append(children, layout.Rigid(vSpace(6)))
+										}
+										return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+									})
+								}),
 							)
 						})
 					}),
@@ -683,19 +683,19 @@ func (s *Shell) pageSharing(gtx layout.Context, th *material.Theme) layout.Dimen
 								b.CornerRadius = unit.Dp(8)
 								return b.Layout(gtx)
 							}),
-						layout.Rigid(vSpace(8)),
-						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							gtx.Constraints.Min.X = gtx.Constraints.Max.X
-							b := material.Button(th, &s.btnReRegion, "更换区域 / 换屏")
-							b.Background = colPanel
-							b.Color = colText
-							b.CornerRadius = unit.Dp(8)
-							return b.Layout(gtx)
-						}),
-						layout.Rigid(vSpace(8)),
-						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							gtx.Constraints.Min.X = gtx.Constraints.Max.X
-							b := material.Button(th, &s.btnRotate, "轮换授权码")
+							layout.Rigid(vSpace(8)),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								gtx.Constraints.Min.X = gtx.Constraints.Max.X
+								b := material.Button(th, &s.btnReRegion, "更换区域 / 换屏")
+								b.Background = colPanel
+								b.Color = colText
+								b.CornerRadius = unit.Dp(8)
+								return b.Layout(gtx)
+							}),
+							layout.Rigid(vSpace(8)),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								gtx.Constraints.Min.X = gtx.Constraints.Max.X
+								b := material.Button(th, &s.btnRotate, "轮换授权码")
 								b.Background = colPanel
 								b.Color = colText
 								b.CornerRadius = unit.Dp(8)
@@ -874,7 +874,7 @@ func (s *Shell) pageViewing(gtx layout.Context, th *material.Theme) layout.Dimen
 			m := op.Record(gtx.Ops)
 			gtx.Constraints.Min = image.Point{}
 			inner := layout.UniformInset(unit.Dp(10)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				return 				layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 						txt := js.Status
 						if txt == "" {
@@ -972,6 +972,7 @@ func (s *Shell) pageViewing(gtx layout.Context, th *material.Theme) layout.Dimen
 						Scale: 1 / gtx.Metric.PxPerDp,
 					}.Layout(gtx)
 					off.Pop()
+					s.drawCursorOverlay(gtx, img, win, true, ox, oy)
 				} else {
 					widget.Image{
 						Src:      paint.NewImageOp(img),
@@ -979,6 +980,7 @@ func (s *Shell) pageViewing(gtx layout.Context, th *material.Theme) layout.Dimen
 						Position: layout.Center,
 						Scale:    1 / gtx.Metric.PxPerDp,
 					}.Layout(gtx)
+					s.drawCursorOverlay(gtx, img, win, false, 0, 0)
 				}
 			} else {
 				layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -1200,6 +1202,71 @@ func (s *Shell) pageRegion(gtx layout.Context, th *material.Theme) layout.Dimens
 			)
 		})
 	})
+}
+
+// drawCursorOverlay 把远端光标叠在观看画面上（P0-3）。
+//
+// 坐标换算必须与 widget.Image 的画法一致：
+//   - 图像按 `Scale: 1/PxPerDp` 画，即 1 图像像素 = 1/PxPerDp 个布局单位；
+//   - 适配模式：Contain 居中，缩放比 f = min(win/natural)；
+//   - 1:1 模式：左上角就是 (ox, oy)，1 图像像素 = 1/PxPerDp。
+//
+// 光标位图本身是"1 图像像素 = 1 布局单位"，所以再用 affine 乘上同样的比例。
+func (s *Shell) drawCursorOverlay(gtx layout.Context, img *image.NRGBA, win image.Point, zoom100 bool, ox, oy int) {
+	if s.cfg.CursorOverlay == nil || img == nil || img.Bounds().Empty() {
+		return
+	}
+	cur, pt, ok := s.cfg.CursorOverlay()
+	if !ok || cur == nil || cur.Bounds().Empty() {
+		return
+	}
+	pxPerDp := gtx.Metric.PxPerDp
+	if pxPerDp <= 0 {
+		pxPerDp = 1
+	}
+	iw, ih := float32(img.Bounds().Dx()), float32(img.Bounds().Dy())
+	nw, nh := iw/pxPerDp, ih/pxPerDp // 图像在布局单位下的自然尺寸
+
+	var originX, originY, scaleDP float32
+	if zoom100 {
+		originX, originY = float32(ox), float32(oy)
+		scaleDP = 1 / pxPerDp
+	} else {
+		f := float32(1)
+		if win.X > 0 && win.Y > 0 && nw > 0 && nh > 0 {
+			f = minF32(float32(win.X)/nw, float32(win.Y)/nh)
+		}
+		originX = (float32(win.X) - nw*f) / 2
+		originY = (float32(win.Y) - nh*f) / 2
+		scaleDP = f / pxPerDp
+	}
+	if scaleDP <= 0 {
+		return
+	}
+	x := originX + float32(pt.X)*scaleDP
+	y := originY + float32(pt.Y)*scaleDP
+
+	// 只画在画面区域内：光标移出采集区域时不要飘到黑边/提示条上。
+	cl := clip.Rect(image.Rectangle{Max: win}).Push(gtx.Ops)
+	defer cl.Pop()
+
+	st := op.Offset(image.Pt(int(x), int(y))).Push(gtx.Ops)
+	defer st.Pop()
+	if scaleDP != 1 {
+		aff := op.Affine(f32.Affine2D{}.Scale(f32.Point{}, f32.Pt(scaleDP, scaleDP))).Push(gtx.Ops)
+		defer aff.Pop()
+	}
+	paint.NewImageOp(cur).Add(gtx.Ops)
+	// Gio 0.10 的 PaintOp 没有矩形参数：先按光标尺寸设裁剪区再填充。
+	defer clip.Rect(image.Rectangle{Max: cur.Bounds().Max}).Push(gtx.Ops).Pop()
+	paint.PaintOp{}.Add(gtx.Ops)
+}
+
+func minF32(a, b float32) float32 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // containRect 计算图像以 contain 方式放进 win 后的实际矩形（与 widget.Fit=Contain 一致）。

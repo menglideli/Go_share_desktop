@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"hash/fnv"
 	"sync"
 	"unsafe"
 
@@ -79,10 +80,10 @@ type bitmapInfoHeader struct {
 
 // cursorArt 是解码后的光标位图：紧凑 BGRA，top-down，带 alpha。
 type cursorArt struct {
-	w, h      int
-	hotX      int
-	hotY      int
-	pix       []byte // w*h*4, BGRA
+	w, h       int
+	hotX       int
+	hotY       int
+	pix        []byte // w*h*4, BGRA
 	monochrome bool
 }
 
@@ -229,6 +230,33 @@ func PurgeCursorCache() {
 	cursorMu.Lock()
 	cursorCache = map[windows.Handle]*cursorArt{}
 	cursorMu.Unlock()
+}
+
+// CursorBitmap 返回当前光标位图的副本、热点与内容哈希（P0-3 的"光标独立传输"）。
+//
+// 为什么要拷贝：调用方会跨 goroutine 持有它（编码成 ctl 消息），而缓存可能被
+// PurgeCursorCache 换掉。只在形状变化时调用，4KB 的拷贝不值得优化。
+// id 用内容哈希而不是 HCURSOR 句柄：句柄会被系统复用，复用成另一种形状时
+// 观看端会画出错误的图标。
+func CursorBitmap() (id uint32, w, h, hotX, hotY int, pix []byte, ok bool) {
+	var ci cursorInfo
+	ci.CbSize = uint32(unsafe.Sizeof(ci))
+	if r, _, _ := pGetCursorInfo.Call(uintptr(unsafe.Pointer(&ci))); r == 0 {
+		return 0, 0, 0, 0, 0, nil, false
+	}
+	if ci.Flags&cursorShowing == 0 || ci.HCursor == 0 {
+		return 0, 0, 0, 0, 0, nil, false
+	}
+	art := getArt(ci.HCursor)
+	if art == nil || art.w <= 0 || art.h <= 0 || len(art.pix) != art.w*art.h*4 {
+		return 0, 0, 0, 0, 0, nil, false
+	}
+	out := make([]byte, len(art.pix))
+	copy(out, art.pix)
+	hash := fnv.New32a()
+	_, _ = hash.Write(out)
+	_, _ = hash.Write([]byte{byte(art.w), byte(art.h), byte(art.hotX), byte(art.hotY)})
+	return hash.Sum32(), art.w, art.h, art.hotX, art.hotY, out, true
 }
 
 func dc() windows.Handle {
