@@ -35,3 +35,8 @@ uicheck-mutate.txt
 rsrc_*.syso
 cmd/**/rsrc_*.syso
 /dist/
+
+# 内部工作文档：不公开（只留在本地）
+/PLAN.md
+/VERIFY.md
+/.workbuddy/
