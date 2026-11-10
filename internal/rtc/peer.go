@@ -70,7 +70,9 @@ type Stats struct {
 	FramesDrop uint64 // 发送侧因背压丢弃
 	ChunksSent uint64
 	ChunksRecv uint64
-	ChunksSkip uint64 // 接收侧因解码跟不上丢弃的分块（AsyncFrames）
+	ChunksSkip uint64
+	// FECRecovered 是用 XOR 校验恢复出来的分块数（P1-7，诊断用）。
+	FECRecovered uint64 // 接收侧因解码跟不上丢弃的分块（AsyncFrames）
 	// BadChunks 是解析失败的分块（魔数不对 / 长度越界）。
 	// ⚠️ 它**不再**表示"分块丢了"：现在丢一块只会让观众端少几条带，
 	// 由 codec.Decoder 的完整性位图判定（见 Decoder.Complete）。
@@ -136,6 +138,10 @@ type Peer struct {
 	frameIn   chan []byte
 	frameDone chan struct{}
 	stopOnce  atomic.Bool
+
+	fecMu     sync.Mutex
+	fecFrames map[uint64]*fecFrame // 只保留最近 fecKeepFrames 帧（P1-7）
+	fecOrder  []uint64
 
 	mu    sync.Mutex
 	stats Stats
@@ -591,6 +597,17 @@ func (p *Peer) onMedia(data []byte) {
 	p.stats.BytesRecv += uint64(len(data))
 	p.mu.Unlock()
 
+	// FEC（P1-7）必须在 UnmarshalFrame **之前**拦：GSF1 不是 GSJ2，
+	// 走解析会被记成坏块（netcheck 断言坏块 0），而且会被当成无效分块丢弃。
+	if len(data) >= 4 && data[0] == 'G' && data[1] == 'S' && data[2] == 'F' && data[3] == '1' {
+		p.onFEC(data)
+		return
+	}
+	// 带 FEC 标记的分块要保留一份（异步路径只把裸分块塞邮箱，晚了就没了）。
+	if len(data) >= 36 && data[24]&0x02 != 0 {
+		p.fecRetain(data)
+	}
+
 	// 异步路径（观看端）：读 goroutine 只把**裸分块**塞进单槽邮箱，
 	// 解析与解码都在独立 goroutine 上（见 Config.AsyncFrames）。
 	// 单槽覆盖式：邮箱里已经压着一块就丢掉更旧的那块、换成最新的 ——
@@ -621,6 +638,99 @@ func (p *Peer) onMedia(data []byte) {
 	}
 
 	p.deliver(data)
+}
+
+// fecKeepFrames 是保留的帧数：只够覆盖"校验块在数据块之后紧跟着到"的窗口。
+const fecKeepFrames = 2
+
+type fecFrame struct {
+	parts map[uint8][]byte
+}
+
+func (p *Peer) fecRetain(data []byte) {
+	// 从头部取 seq 与 chunkIdx（布局见 codec 的线格式说明）。
+	seq := uint64(0)
+	for i := 0; i < 8; i++ {
+		seq = seq<<8 | uint64(data[4+i])
+	}
+	idx := data[26]
+	p.fecMu.Lock()
+	defer p.fecMu.Unlock()
+	if p.fecFrames == nil {
+		p.fecFrames = map[uint64]*fecFrame{}
+	}
+	f := p.fecFrames[seq]
+	if f == nil {
+		f = &fecFrame{parts: map[uint8][]byte{}}
+		p.fecFrames[seq] = f
+		p.fecOrder = append(p.fecOrder, seq)
+		// 只保留最近 2 帧：FEC 恢复窗口只有"数据块之后紧跟校验块"这一段。
+		for len(p.fecOrder) > fecKeepFrames {
+			old := p.fecOrder[0]
+			p.fecOrder = p.fecOrder[1:]
+			delete(p.fecFrames, old)
+		}
+	}
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	f.parts[idx] = cp
+}
+
+// onFEC 处理一个校验块：恰好缺一块时用 XOR 恢复，并从同一路径交付。
+func (p *Peer) onFEC(data []byte) {
+	g, ok, err := ParseFEC(data)
+	if err != nil || !ok {
+		return
+	}
+	p.fecMu.Lock()
+	f := p.fecFrames[g.Seq]
+	p.fecMu.Unlock()
+	if f == nil {
+		return
+	}
+	base := int(g.Group) * int(g.DataCount)
+	others := make([][]byte, 0, len(g.Lengths))
+	missing := -1
+	for i := range g.Lengths {
+		idx := uint8(base + i)
+		part, has := f.parts[idx]
+		if !has {
+			if missing >= 0 {
+				return // 一组丢两块以上：XOR 救不了，交给精确补发
+			}
+			missing = i
+			continue
+		}
+		others = append(others, part)
+	}
+	if missing < 0 {
+		return // 一块没丢：校验块白到，直接丢
+	}
+	rec, ok := codec.XORRecover(others, g.Parity, int(g.Lengths[missing]))
+	if !ok {
+		return
+	}
+	p.mu.Lock()
+	p.stats.FECRecovered++
+	p.mu.Unlock()
+	// 异步路径：塞回同一个单槽邮箱（覆盖式，和普通分块一致）。
+	if p.frameIn != nil {
+		select {
+		case p.frameIn <- rec:
+			return
+		default:
+		}
+		select {
+		case <-p.frameIn:
+		default:
+		}
+		select {
+		case p.frameIn <- rec:
+		default:
+		}
+		return
+	}
+	p.deliver(rec)
 }
 
 // Stats 返回当前统计快照。

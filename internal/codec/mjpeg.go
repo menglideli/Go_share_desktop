@@ -99,6 +99,8 @@ type Frame struct {
 	TotalTiles int
 	Tiles      []Tile // 本**块**携带的条带（未变化的条带不出现）
 	Full       bool   // 整个逻辑帧是否包含全部条带（首帧 / 强制关键帧 / 变化过大）
+	// FEC 表示这一帧后面会跟 XOR 校验块（P1-7）：接收端据此保留分块以便恢复丢块。
+	FEC bool
 	// TilesMask 是逻辑帧的条带集合位图（bit i = 条带 i 在本帧内）。
 	// 每块里都写同一份 —— 这样任一块到达都能告诉接收端"还缺哪些"。
 	TilesMask uint64
@@ -544,6 +546,8 @@ const (
 	frameHeaderLen = 36
 	tileHeaderLen  = 8
 	flagFull       = 1 << 0
+	// flagFEC 表示"这一帧带 FEC 校验块"。旧端不认识这个位，只是忽略（不影响解析）。
+	flagFEC = 1 << 1
 	// maxTiles 是条带数上限：条带集合用 uint64 位图描述（见 Frame.TilesMask）。
 	maxTiles = 64
 	// MaxChunkPayload 是分块的**标称**字节上限（尽量不超过）。
@@ -585,7 +589,10 @@ func (f *Frame) Marshal() ([]byte, error) {
 	binary.BigEndian.PutUint16(buf[20:22], uint16(f.TotalTiles))
 	binary.BigEndian.PutUint16(buf[22:24], uint16(f.TileH))
 	if f.Full {
-		buf[24] = flagFull
+		buf[24] |= flagFull
+	}
+	if f.FEC {
+		buf[24] |= flagFEC
 	}
 	buf[25] = f.Refresh
 	buf[26] = f.ChunkIdx
@@ -676,6 +683,7 @@ func UnmarshalFrame(buf []byte) (*Frame, error) {
 		TileH:      int(binary.BigEndian.Uint16(buf[22:24])),
 	}
 	f.Full = buf[24]&flagFull != 0
+	f.FEC = buf[24]&flagFEC != 0
 	f.Refresh = buf[25]
 	f.ChunkIdx = buf[26]
 	f.ChunkTotal = buf[27]

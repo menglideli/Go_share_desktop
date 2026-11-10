@@ -88,6 +88,8 @@ func main() {
 	windowTitle := flag.String("window", "", "跟随分享一个窗口（标题子串，如 \"Visual Studio Code\"）")
 	// P1-5 的降采样旋钮：先手动验证效果，自适应阶梯之后接上。
 	scalePct := flag.Int("scale", 100, "编码前降采样比例（100 = 不缩放，67 = 2/3，50 = 1/2）")
+	// P1-7：大帧 XOR 校验。默认开；-no-fec 用于 A/B 测量额外流量。
+	noFEC := flag.Bool("no-fec", false, "关闭大帧 XOR 校验（P1-7，默认开启）")
 	flag.Parse()
 
 	if *logPath != "" {
@@ -135,6 +137,7 @@ func main() {
 		noCursor:    *noCursorCap,
 		windowTitle: *windowTitle,
 		scalePct:    *scalePct,
+		noFEC:       *noFEC,
 	}
 	a.clock = &rtc.Clock{}
 	a.pl = newPlayout(a.disp.Recycle())
@@ -380,6 +383,8 @@ type app struct {
 	windowTitle string
 	// scalePct 是编码前降采样比例（-scale，P1-5）。
 	scalePct int
+	// noFEC 关闭大帧 XOR 校验（-no-fec，P1-7 的 A/B 用）。
+	noFEC bool
 	// clock 估计"分享端时钟 - 本端时钟"的偏移（见 internal/rtc/clock.go）。
 	clock *rtc.Clock
 	// pl 是呈现调度器（见 playout.go）。
@@ -584,6 +589,7 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 		FPS:     a.fps,
 		Preset:  preset,
 		Cursor:  true,
+		FEC:     !a.noFEC,
 		// 全量帧补帧策略（R32）：接入窗口内密集补 + 稳态靠观众请求。
 		KeyBurst:    a.keyBurst,
 		KeyInterval: a.keyInterval,

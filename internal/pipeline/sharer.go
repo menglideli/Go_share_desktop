@@ -101,6 +101,9 @@ type Config struct {
 	// 不必持续付出补画布的带宽。实测开启 3s 稳态周期会让带宽从 5.5 涨到
 	// 9.2 Mbps（+67%），代价明显。负数同样表示禁用。
 	KeyInterval time.Duration
+	// FEC 开启大帧的 XOR 校验（P1-7，默认开）：≥4 块的全量/修复帧按 8 块一组
+	// 加一个校验块，代价约 +12.5% 流量，能恢复"组内丢一块"。
+	FEC bool
 	// AdaptiveOff 关闭自适应质量（默认开启）。
 	//
 	// 自适应干什么：扇出侧任何一名观众的发送缓冲积压（背压丢帧）时，
@@ -114,6 +117,7 @@ type Config struct {
 }
 
 func (c Config) withDefaults() Config {
+	// FEC 默认开启（零值语义会是关闭，所以这里不依赖零值，由调用方显式给）。
 	c.fpsAuto = c.FPS <= 0
 	if c.fpsAuto {
 		c.FPS = captureFPSFor(c.Preset, c.Region, c.Display)
@@ -410,6 +414,12 @@ func (s *Sharer) adaptLoop(ctx context.Context) {
 		s.adaptTick(drops, wm)
 	}
 }
+
+// FEC 参数（P1-7）：每 8 块一组校验；少于 4 块的小帧不值得（校验本身也有头）。
+const (
+	fecGroup     = 8
+	fecMinChunks = 4
+)
 
 // scaleShapeFor 按比例返回（缩放后的形状, 该比例）。100% 时原样返回。
 func scaleShapeFor(c rtc.CursorShape, pct int) (rtc.CursorShape, int) {
@@ -1387,7 +1397,14 @@ func (s *Sharer) emit(f capture.Frame) error {
 	// 2K 全量 ≈2MB/次的拷贝全串在采集 goroutine 上，4 人时全员 fps 腰斩）。
 	// 现在按"每块自带帧头 + 完整条带"切成若干可独立解析的分块，逐条发。
 	parts := out.Split(codec.MaxChunkPayload)
-	chunks := make([][]byte, 0, len(parts))
+	// P1-7：大帧按 8 块一组加 XOR 校验（+12.5% 流量，能救"组内丢一块"）。
+	fec := s.cfg.FEC && len(parts) >= fecMinChunks
+	if fec {
+		for _, c := range parts {
+			c.FEC = true
+		}
+	}
+	chunks := make([][]byte, 0, len(parts)*9/8+1)
 	total := 0
 	for _, c := range parts {
 		data, err := c.Marshal()
@@ -1396,6 +1413,26 @@ func (s *Sharer) emit(f capture.Frame) error {
 		}
 		chunks = append(chunks, data)
 		total += len(data)
+	}
+	if fec {
+		for g := 0; g < len(chunks); g += fecGroup {
+			end := g + fecGroup
+			if end > len(chunks) {
+				end = len(chunks)
+			}
+			group := chunks[g:end]
+			par, _ := codec.XORParity(group)
+			lens := make([]uint32, len(group))
+			for i, c := range group {
+				lens[i] = uint32(len(c))
+			}
+			msg := rtc.MarshalFEC(rtc.FECGroup{
+				Seq: out.Seq, TS: uint32(out.TS), Group: uint16(g / fecGroup),
+				DataCount: uint16(len(group)), Lengths: lens, Parity: par,
+			})
+			chunks = append(chunks, msg)
+			total += len(msg)
+		}
 	}
 	s.latest.Store(&wireFrame{seq: out.Seq, chunks: chunks, bytes: total})
 	// 广播唤醒（非阻塞：慢观众的 wake 里已有信号就说明它还没读，
