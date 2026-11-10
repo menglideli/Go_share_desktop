@@ -55,9 +55,12 @@ type ViewerRow struct {
 	// Seq / LateMS / BehindMS 是观众回报的同步状态（P0-5）：
 	// 当前显示帧号、上屏迟到毫秒、落后共同时间线多少毫秒。
 	// SyncKnown=false 时界面保持旧版显示（旧客户端不会回报）。
-	Seq       uint64
-	LateMS    int64
-	BehindMS  int64
+	Seq      uint64
+	LateMS   int64
+	BehindMS int64
+	// MissTiles / Repairs 是该观众累计缺块与修复次数（P3-2，0 时不显示）。
+	MissTiles uint64
+	Repairs   uint64
 	SyncKnown bool
 }
 

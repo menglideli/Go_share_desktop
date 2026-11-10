@@ -398,6 +398,9 @@ type viewerStat struct {
 	TS     uint32 `json:"ts"`     // 当前显示帧的编码时刻（分享端时钟毫秒）
 	LateMS int64  `json:"lateMs"` // 上屏迟到了多少毫秒（0 = 正点）
 	DMS    int    `json:"d"`      // 该观众自己的播放缓冲
+	// MissTiles / Repairs 是该观众累计的缺块条带数与修复请求次数（P3-2）。
+	MissTiles uint64 `json:"miss,omitempty"`
+	Repairs   uint64 `json:"repairs,omitempty"`
 	// At 是采样时刻（分享端时钟毫秒）：所有观众按同一个 500ms 桶采样，
 	// 分享端才能比较"同一时刻大家显示的是哪一帧"。
 	At uint32 `json:"at"`
@@ -949,6 +952,7 @@ func (a *app) pushShareState() {
 			row.Seq = vs.Seq
 			row.LateMS = vs.LateMS
 			row.SyncKnown = true
+			row.MissTiles, row.Repairs = vs.MissTiles, vs.Repairs
 			// 落后 = 采样时"这帧已经多老"再减掉它本该等待的播放缓冲。
 			// 用**时间**而不是帧数：发送侧丢帧会让帧号出现永久空档，
 			// 按序号相减会把"跳过一帧"错报成"落后好几帧"（实测踩过）。

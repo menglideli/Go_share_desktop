@@ -60,7 +60,10 @@ func (a *app) reportShown(seq uint64, ts uint32, lateMS int64) {
 	if p == nil {
 		return
 	}
-	b, err := json.Marshal(viewerStat{Seq: seq, TS: ts, LateMS: lateMS, DMS: a.playoutMS, At: at})
+	b, err := json.Marshal(viewerStat{
+		Seq: seq, TS: ts, LateMS: lateMS, DMS: a.playoutMS, At: at,
+		MissTiles: a.wMissTiles.Load(), Repairs: a.wRepairs.Load(),
+	})
 	if err != nil {
 		return
 	}
@@ -126,7 +129,8 @@ func syncLine(rows []ui.ViewerRow) string {
 		if n > 0 {
 			b.WriteString(" · ")
 		}
-		fmt.Fprintf(&b, "%s #%d 晚%dms 落后%dms", r.Name, r.Seq, r.LateMS, r.BehindMS)
+		fmt.Fprintf(&b, "%s #%d 晚%dms 落后%dms 缺%d/补%d",
+			r.Name, r.Seq, r.LateMS, r.BehindMS, r.MissTiles, r.Repairs)
 		n++
 	}
 	return b.String()
