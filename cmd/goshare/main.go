@@ -164,6 +164,7 @@ func main() {
 		OnRotate:     a.rotateCode,
 		OnPickRegion: a.pickRegionSnapshot,
 		OnRegionDone: a.regionDone,
+		OnWindows:    a.listWindows,
 		OnJoin:       a.join,
 		OnScan:       a.scan,
 		OnLeaveView:  a.leaveView,
@@ -526,11 +527,16 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 		}
 	}
 
-	// 跟随窗口（-window）：区域先按窗口当前位置定下来，之后由 FollowWindow 轮询更新。
-	// 窗口在别的显示器上时，把采集显示器也切过去 —— 否则区域会被 clamp 成一条边。
+	// 跟随窗口：UI 里选中的窗口优先于 -window（命令行是无人值守/验证入口）。
+	// 区域先按窗口当前位置定下来，之后由 FollowWindow 轮询更新。窗口在别的显示器上时，
+	// 把采集显示器也切过去 —— 否则区域会被 clamp 成一条边。
 	var followHandle uintptr
-	if a.windowTitle != "" {
-		if wi, ok := capture.FindWindowByTitle(a.windowTitle); ok {
+	winTitle := a.windowTitle
+	if winTitle == "" {
+		winTitle = opts.Window
+	}
+	if winTitle != "" {
+		if wi, ok := capture.FindWindowByTitle(winTitle); ok {
 			if d, ok := a.displayAt(wi.X+wi.W/2, wi.Y+wi.H/2); ok {
 				opts.Display = d
 			}
@@ -542,7 +548,7 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 			log.Printf("跟随窗口：%q %dx%d @ (%d,%d) · 显示器 %s",
 				wi.Title, wi.W, wi.H, wi.X, wi.Y, opts.Display.Name)
 		} else {
-			log.Printf("没找到标题包含 %q 的窗口，按整屏分享", a.windowTitle)
+			log.Printf("没找到标题包含 %q 的窗口，按整屏分享", winTitle)
 		}
 	}
 
@@ -1071,6 +1077,16 @@ func (a *app) stopShare() {
 	if hadSession {
 		log.Printf("分享已停止")
 	}
+}
+
+// listWindows 返回可跟随分享的窗口（设置页的"跟随窗口"列表）。
+func (a *app) listWindows() []ui.WindowRow {
+	ws := capture.ListWindows()
+	out := make([]ui.WindowRow, 0, len(ws))
+	for _, w := range ws {
+		out = append(out, ui.WindowRow{Title: w.Title, W: w.W, H: w.H})
+	}
+	return out
 }
 
 // displayAt 返回包含该虚拟屏幕坐标点的显示器（-window 选屏用）。

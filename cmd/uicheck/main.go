@@ -272,6 +272,14 @@ func cases() []testCase {
 	return []testCase{
 		{name: "home", setup: nil},
 		{name: "setup", setup: nil},
+		{name: "setup-windows", setup: func(s *ui.Shell) {
+			// P1-2：设置页的"跟随窗口"列表。
+			s.SetWindowsForTest([]ui.WindowRow{
+				{Title: "Visual Studio Code", W: 1600, H: 1000},
+				{Title: "Windows Terminal", W: 1200, H: 800},
+				{Title: "GoShare · 内网桌面共享", W: 1180, H: 780},
+			})
+		}},
 		{name: "sharing", setup: func(s *ui.Shell) {
 			s.SetShareState(ui.ShareState{
 				Active: true, Code: "482913", Addrs: fakeAddrs, Port: 9000,
@@ -539,7 +547,7 @@ func render(win *headless.Window, th *material.Theme, w, h int, name string, set
 
 func routeOf(name string) ui.Route {
 	switch name {
-	case "setup":
+	case "setup", "setup-windows":
 		return ui.RouteSetup
 	case "sharing", "sharing-paused":
 		return ui.RouteSharing

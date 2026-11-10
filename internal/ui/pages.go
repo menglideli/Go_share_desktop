@@ -61,12 +61,29 @@ func (s *Shell) handleEvents(gtx layout.Context) {
 				}
 			}
 		}
+		// 分享窗口（P1-2）：点一行就选中它（再点一次取消）。
+		for i := range s.winBtns {
+			if i >= len(s.windowRows) {
+				break
+			}
+			if s.winBtns[i].Clicked(gtx) {
+				if s.winSel == i {
+					s.winSel = -1
+				} else {
+					s.winSel = i
+				}
+			}
+		}
+		if s.btnWinRef.Clicked(gtx) {
+			s.RefreshWindows()
+		}
 		if s.btnStart.Clicked(gtx) {
 			if s.cfg.OnStartShare != nil {
 				err := s.cfg.OnStartShare(ShareOptions{
 					Display: s.selDisplay,
 					Region:  s.region,
 					Preset:  s.selPreset,
+					Window:  s.SelectedWindow(),
 				})
 				if err != nil {
 					s.Toast("启动失败：" + err.Error())
@@ -390,6 +407,73 @@ func (s *Shell) pageSetup(gtx layout.Context, th *material.Theme) layout.Dimensi
 				})
 			}),
 			layout.Rigid(vSpace(14)),
+			// 分享窗口（P1-2）：选中后自动跟随该窗口，优先于"共享区域"。
+			// 整块（含段后间距）都在 OnWindows==nil 时收起，避免多出一个 14dp 的空隙。
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				if s.cfg.OnWindows == nil {
+					return layout.Dimensions{}
+				}
+				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return s.section(gtx, th, "跟随窗口（可选）", func(gtx layout.Context) layout.Dimensions {
+							children := make([]layout.FlexChild, 0, len(s.windowRows)+1)
+							for i, w := range s.windowRows {
+								i, w := i, w
+								if i >= len(s.winBtns) {
+									break
+								}
+								label := w.Title
+								if len([]rune(label)) > 32 {
+									label = string([]rune(label)[:32]) + "…"
+								}
+								if s.winSel == i {
+									label = "✓ " + label
+								}
+								children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									b := material.Button(th, &s.winBtns[i], label)
+									b.Background = colPanel
+									b.Color = colText
+									b.CornerRadius = unit.Dp(6)
+									b.TextSize = unit.Sp(12)
+									b.Inset = layout.UniformInset(unit.Dp(5))
+									return b.Layout(gtx)
+								}))
+								children = append(children, layout.Rigid(vSpace(4)))
+							}
+							if len(s.windowRows) == 0 {
+								l := material.Body2(th, "没有可分享的窗口")
+								l.Color = colDim
+								children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									return l.Layout(gtx)
+								}))
+							}
+							children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+										b := material.Button(th, &s.btnWinRef, "刷新窗口")
+										b.Background = colBG
+										b.Color = colDim
+										b.CornerRadius = unit.Dp(6)
+										b.TextSize = unit.Sp(12)
+										b.Inset = layout.UniformInset(unit.Dp(4))
+										return b.Layout(gtx)
+									}),
+									layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+										l := material.Caption(th, "选中后分享区域会跟着窗口走")
+										l.Color = colDim
+										return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+											layout.Rigid(func(gtx layout.Context) layout.Dimensions { return layout.Dimensions{Size: image.Pt(8, 0)} }),
+											layout.Rigid(func(gtx layout.Context) layout.Dimensions { return l.Layout(gtx) }),
+										)
+									}),
+								)
+							}))
+							return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+						})
+					}),
+					layout.Rigid(vSpace(14)),
+				)
+			}),
 			// 质量
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return s.section(gtx, th, "画质与帧率", func(gtx layout.Context) layout.Dimensions {

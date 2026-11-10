@@ -61,6 +61,12 @@ type ViewerRow struct {
 	SyncKnown bool
 }
 
+// WindowRow 是一个可跟随分享的顶层窗口（P1-2）。
+type WindowRow struct {
+	Title string
+	W, H  int
+}
+
 // FoundRow 是局域网发现列表的一行。
 type FoundRow struct {
 	Name string
@@ -127,6 +133,8 @@ type ShellConfig struct {
 	OnJoin func(addr, code string)
 	// OnScan 请求扫描局域网。同上。
 	OnScan func()
+	// OnWindows 返回可跟随分享的顶层窗口（P1-2）。nil 表示不提供"分享窗口"入口。
+	OnWindows func() []WindowRow
 	// OnLeaveView 退出观看。
 	OnLeaveView func()
 
@@ -152,6 +160,8 @@ type ShareOptions struct {
 	Display capture.Display
 	Region  capture.Rect // 零值表示整屏
 	Preset  string
+	// Window 非空时优先跟随该标题的窗口（P1-2，优先于 Region）。
+	Window string
 }
 
 // Shell 是应用外壳。
@@ -202,6 +212,11 @@ type Shell struct {
 
 	dispEnum  widget.Enum
 	presetEnm widget.Enum
+	// 分享窗口（P1-2）：列表 + 选中项（-1 = 不跟随窗口）
+	windowRows []WindowRow
+	winSel     int
+	winBtns    []widget.Clickable
+	btnWinRef  widget.Clickable
 	// panelList 让分享中面板的"信息区"可滚动：观众一多面板就超高，
 	// 不滚动的话底部的"停止分享"会被推出窗口（实测 780 高窗口 + 2 个观众就放不下）。
 	panelList widget.List
@@ -253,6 +268,8 @@ func NewShell(cfg ShellConfig) *Shell {
 		route:        RouteHome,
 		preview:      nil,
 		regionReturn: RouteSetup,
+		// -1 = 不跟随窗口（零值是 0，会误把第一行当成已选中）。
+		winSel: -1,
 	}
 	if len(cfg.Displays) > 0 {
 		s.selDisplay = cfg.Displays[0]
@@ -288,6 +305,40 @@ func (s *Shell) Go(r Route) {
 	s.mu.Lock()
 	s.route = r
 	s.mu.Unlock()
+	// 进入设置页时刷新一次"可分享窗口"列表（EnumWindows 不便宜，不能每帧调）。
+	if r == RouteSetup && s.cfg.OnWindows != nil {
+		s.RefreshWindows()
+	}
+}
+
+// RefreshWindows 重新枚举可分享的窗口（P1-2）。
+func (s *Shell) RefreshWindows() {
+	if s.cfg.OnWindows == nil {
+		return
+	}
+	rows := s.cfg.OnWindows()
+	if len(rows) > 8 {
+		rows = rows[:8]
+	}
+	s.mu.Lock()
+	s.windowRows = rows
+	if s.winSel >= len(rows) {
+		s.winSel = -1
+	}
+	for len(s.winBtns) < len(rows) {
+		s.winBtns = append(s.winBtns, widget.Clickable{})
+	}
+	s.mu.Unlock()
+}
+
+// SelectedWindow 返回当前选中的窗口标题（空 = 整屏/区域）。
+func (s *Shell) SelectedWindow() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.winSel < 0 || s.winSel >= len(s.windowRows) {
+		return ""
+	}
+	return s.windowRows[s.winSel].Title
 }
 
 // SetShareState 更新分享端状态。
@@ -393,6 +444,12 @@ func (s *Shell) SetDragPreview(from, to image.Point) {
 func (s *Shell) SetZoom100(on bool) {
 	s.zoom100 = on
 	s.panX, s.panY = 0, 0
+}
+
+// SetWindowsForTest 注入"可分享窗口"列表（离屏校验用；生产由 ShellConfig 提供）。
+func (s *Shell) SetWindowsForTest(rows []WindowRow) {
+	s.cfg.OnWindows = func() []WindowRow { return rows }
+	s.windowRows = rows
 }
 
 // SetCursorOverlay 覆盖光标叠加回调（离屏校验用；生产由 ShellConfig 提供）。
