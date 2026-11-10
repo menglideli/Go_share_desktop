@@ -13,6 +13,18 @@
 
 ---
 
+## 界面
+
+| 设置（含跟随窗口） | 分享中（观众列表 + 同步状态） |
+|---|---|
+| ![设置](testdata/ui-golden/ui-setup-windows.png) | ![分享中](testdata/ui-golden/ui-sharing-sync.png) |
+
+> 截图是 `cmd/uicheck` 的离屏渲染基线：`testdata/ui-golden/` 里的图就是程序**真实**的
+> 界面输出（逐像素回归用），不是手绘图。悬浮条见 `ui-hud.png`，观看页见
+> `ui-viewing-cursor.png`。
+
+---
+
 ## 快速开始
 
 ### 分享端（被看的一方）

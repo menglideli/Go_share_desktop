@@ -596,7 +596,7 @@ SCTP 不暴露网络丢包，就用"修复频率"作为代理指标，并明确�
 | P4-3 | LICENSE + CHANGELOG + GitHub Release 流程 | 🟡 LICENSE（PolyForm Noncommercial 1.0.0，禁商用）+ CHANGELOG 已完成；Release 流程待做 |
 | P4-4 | ~~版本号单一来源~~ ✅ 2026-11-10 | `build.ps1` 用 `-Version` 重写 winres 临时副本；实测 0.7.4 三者一致 |
 | P4-5 | `PLAN.md` / `VERIFY.md` 移入 `docs/`，根目录只留 README | 根目录干净 |
-| P4-6 | 补 README 截图（`testdata/ui-golden` 里的渲染图可直接用） | README 有界面图 |
+| P4-6 | ~~补 README 截图~~ ✅ 2026-11-10 | README 顶部引用 4 张真实渲染基线（设置/分享中/悬浮条/观看） |
 
 ---
 
