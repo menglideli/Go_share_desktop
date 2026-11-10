@@ -70,9 +70,14 @@ func PresetByName(name string) Preset {
 type Config struct {
 	Display capture.Display
 	Region  capture.Rect
-	FPS     int // 采集目标帧率（库参数），0 用默认 30
-	Preset  Preset
-	Cursor  bool
+	// FPS 是采集目标帧率，0 = 按档位与面积自动决定（见 captureFPSFor）。
+	// 显式给值（-fps）时会原样使用，用于调参与排障。
+	FPS    int
+	Preset Preset
+	Cursor bool
+	// fpsAuto 记录 FPS 是否由档位自动决定（withDefaults 里设置）。
+	// 自动模式下，换区域/换屏会按新面积重算帧率；显式指定则不动。
+	fpsAuto bool
 	// Warmup 是"丢弃首帧黑帧"的超时上限（R25）。
 	// 0 表示用默认 600ms；负数表示禁用预热（排障对比时有用）。
 	Warmup time.Duration
@@ -109,8 +114,9 @@ type Config struct {
 }
 
 func (c Config) withDefaults() Config {
-	if c.FPS <= 0 {
-		c.FPS = 30
+	c.fpsAuto = c.FPS <= 0
+	if c.fpsAuto {
+		c.FPS = captureFPSFor(c.Preset, c.Region, c.Display)
 	}
 	if c.KeyBurst == 0 {
 		c.KeyBurst = 3 * time.Second
@@ -122,6 +128,34 @@ func (c Config) withDefaults() Config {
 		c.IdleHeartbeat = 2 * time.Second
 	}
 	return c
+}
+
+// captureFPSFor 决定采集目标帧率（P0-2）。
+//
+// 为什么不能直接照抄 Preset.MaxFPS：MaxFPS 原先只限制**发送**，采集源一直按
+// 30fps 配置 —— 于是"流畅60"永远是假 60（实测 ≤30）。
+//
+// 但 60fps 不是免费的：2K 一帧编码 12~15ms + 采集 4.8ms，60fps 的预算是
+// 16.7ms/帧，根本不成立；硬开只会让编码队列堆积、延迟暴涨。所以按**采集面积**
+// 回落：超过 2.5M 像素（≈2K）且档位要 60 时，按 30 采集并在日志里说明原因。
+func captureFPSFor(p Preset, r capture.Rect, d capture.Display) int {
+	target := p.MaxFPS
+	if target <= 0 {
+		// "最大"档不额外限帧，但采集仍按 30：60fps 会让带宽翻倍，
+		// 而这个档位的承诺是"画质优先"，不是"高帧率"。
+		target = 30
+	}
+	if target > 60 {
+		target = 60
+	}
+	w, h := d.W, d.H
+	if !r.Empty() {
+		w, h = r.W, r.H
+	}
+	if w*h > 2_500_000 && target > 30 {
+		return 30
+	}
+	return target
 }
 
 // Stats 是管线运行统计。
@@ -170,15 +204,23 @@ type peerSlot struct {
 // Sharer 是一条分享管线：单采集、单编码、扇出给多个观众。
 type Sharer struct {
 	cfg Config
+	// ctx 留给"换区域/换屏时可能要重建采集源"用（帧率随之变化，见 desiredFPS）。
+	ctx context.Context
 	// src 用原子指针：Run 的 WaitFrame 可能阻塞很久（桌面静止时几秒不出帧），
 	// 跨屏热切换（SetDisplay）若持锁等它就会卡死。换源 = 建新源 → 原子换 → 关旧源，
 	// Run 每轮循环重新取指针，最多少发一帧旧画面，编码器按新尺寸自重配置。
 	src atomic.Pointer[capture.Source]
 	enc *codec.Encoder
+	// fps 是当前采集目标帧率（可随区域变化，用原子读给日志/HUD 用）。
+	fps atomic.Int32
+	// fpsExplicit > 0 表示用户用 -fps 指定了帧率，不再自动重算。
+	fpsExplicit int
 
 	mu    sync.Mutex
 	peers map[*rtc.Peer]*peerSlot
 	stats Stats
+	// curDisplay 是当前采集的显示器（SetRegion 重算帧率要用它的尺寸）。
+	curDisplay capture.Display
 	// latest 是扇出共享缓存：最近一帧的线格式数据（见 wireFrame 注释）。
 	latest atomic.Pointer[wireFrame]
 	// wantKey 表示下一位观众（或全部观众）需要全量帧
@@ -422,22 +464,68 @@ func NewSharer(ctx context.Context, cfg Config) (*Sharer, error) {
 			TileHeight: cfg.Preset.TileHeight,
 			Dirty:      cfg.Preset.Dirty,
 		}),
-		peers:     map[*rtc.Peer]*peerSlot{},
-		lastKeyAt: time.Now(),
+		peers:      map[*rtc.Peer]*peerSlot{},
+		lastKeyAt:  time.Now(),
+		ctx:        ctx,
+		curDisplay: cfg.Display,
 	}
+	if !cfg.fpsAuto {
+		sh.fpsExplicit = cfg.FPS
+	}
+	sh.fps.Store(int32(cfg.FPS))
 	sh.src.Store(src)
 	return sh, nil
+}
+
+// CaptureFPS 返回当前实际使用的采集目标帧率（启动日志/HUD 用）。
+func (s *Sharer) CaptureFPS() int { return int(s.fps.Load()) }
+
+// desiredFPS 按当前区域/显示器与档位重算采集帧率。
+// 用户用 -fps 显式指定时保持不动。
+func (s *Sharer) desiredFPS(r capture.Rect, d capture.Display) int {
+	if s.fpsExplicit > 0 {
+		return s.fpsExplicit
+	}
+	return captureFPSFor(s.cfg.Preset, r, d)
 }
 
 // Source 返回底层采集源。
 func (s *Sharer) Source() *capture.Source { return s.src.Load() }
 
 // Close 停止采集。
-func (s *Sharer) Close() error { return s.src.Load().Close() }
+func (s *Sharer) Close() error {
+	if src := s.src.Load(); src != nil {
+		return src.Close()
+	}
+	return nil
+}
 
-// SetRegion 热切换采集区域（分辨率不变时编码器不重建 → 无感切换）。
+// SetRegion 热切换采集区域。
+//
+// 分辨率不变时编码器不重建 → 无感切换；但**帧率可能随面积变**
+// （2K 全屏 30fps、1280×720 可以 60fps），所以面积变化导致帧率需要改变时，
+// 要重建采集源 —— 采集流的 fps 在创建时固定，不能就地改。用"先建后换"，
+// 观众在这几百毫秒里看到的仍是旧源，不会黑。
 func (s *Sharer) SetRegion(r capture.Rect) {
-	s.src.Load().SetRegion(r)
+	src := s.src.Load()
+	if src == nil {
+		return
+	}
+	s.mu.Lock()
+	d := s.curDisplay
+	s.mu.Unlock()
+
+	// 只关心"面积档位"是否跨过阈值：同档位内换区域不需要重建。
+	want := s.desiredFPS(r, d)
+	if want == s.CaptureFPS() {
+		src.SetRegion(r)
+		s.enc.ForceKeyFrame()
+		return
+	}
+	if err := s.rebuildSource(d, r, want); err != nil {
+		// rebuildSource 已按旧参数把源恢复回来，这里只打日志，不再对已关闭的源动手。
+		log.Printf("切换区域时重建采集源失败（%v），保持原区域", err)
+	}
 	s.enc.ForceKeyFrame()
 }
 
@@ -446,29 +534,66 @@ func (s *Sharer) SetRegion(r capture.Rect) {
 // 为什么不能复用 SetRegion：采集流绑定在显示器上，换屏必须重建 capture.Source
 // （新显示器可能分辨率、DPI 缩放都不同，光标坐标原点也跟着变）。
 //
-// 顺序是"先建好新源再换"：新建/预热可能花几百毫秒甚至失败，这段时间旧源照常出帧，
-// 观众无感；反过来"先关旧再建新"会让观众看到一段黑。预热同样不能省 ——
-// DXGI 首帧常是未初始化黑帧（R25），换屏后观众第一眼不能是黑的。
+// 重建顺序见 rebuildSource：先关旧源再建新源（两路 DXGI 复制并存会让新源掉速）。
+// 观众在这几百毫秒里看到的是上一帧，不会黑；预热也不能省 —— DXGI 首帧常是
+// 未初始化黑帧（R25），新源的第一帧必须先丢掉。
 func (s *Sharer) SetDisplay(ctx context.Context, d capture.Display, r capture.Rect) error {
+	if err := s.rebuildSource(d, r, s.desiredFPS(r, d)); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.curDisplay = d
+	s.mu.Unlock()
+	return nil
+}
+
+// rebuildSource 用新的显示器/区域/帧率重建采集源。
+//
+// ⚠️ 必须**先关旧源再建新源**。实测：先建新源、后关旧源时，同一个显示器上
+// 会短暂出现两路 DXGI duplication，新源的交付率会掉到 ~19fps（动画内容下
+// 本应 50~60fps），而且不会自己恢复 —— 表现是"切了区域之后变得很卡"。
+// 反过来先关旧源，观众只是在这几百毫秒里看不到新帧（画面停在上一帧，不会黑）。
+// 新建失败时用旧参数重建一次兜底，避免一次切换把分享彻底弄死。
+func (s *Sharer) rebuildSource(d capture.Display, r capture.Rect, fps int) error {
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var oldRegion capture.Rect
+	oldFPS := s.CaptureFPS()
+	if old := s.src.Load(); old != nil {
+		oldRegion = old.Region()
+	}
+	if old := s.src.Swap(nil); old != nil {
+		_ = old.Close()
+	}
+
 	src, err := capture.NewSource(ctx, capture.Options{
 		Display: d,
 		Region:  r,
-		FPS:     s.cfg.FPS,
+		FPS:     fps,
 		Cursor:  s.cfg.Cursor,
 	})
 	if err != nil {
+		// 兜底：按旧参数把源建回来，至少保持分享不断（帧率/区域退回旧值）。
+		if o, e2 := capture.NewSource(ctx, capture.Options{
+			Display: d, Region: oldRegion, FPS: oldFPS, Cursor: s.cfg.Cursor,
+		}); e2 == nil {
+			s.src.Store(o)
+			log.Printf("重建采集源失败（%v），已按旧区域恢复", err)
+		}
 		return err
 	}
 	if s.cfg.Warmup >= 0 {
 		_, _ = src.Warmup(ctx, 3, s.cfg.Warmup)
 	}
-	old := s.src.Swap(src)
-	if old != nil {
-		// 旧源的 WaitFrame 可能还在阻塞：Close 会让它报错返回，Run 下一轮取到新源。
-		_ = old.Close()
-	}
+	s.src.Store(src)
 	// 尺寸大概率变了：全量帧让观众画布整体重建，避免 dirty 增量只盖一部分（R32 同类）。
 	s.enc.ForceKeyFrame()
+	s.fps.Store(int32(fps))
+	if oldFPS != fps {
+		log.Printf("采集帧率 %d → %d fps（面积变化）", oldFPS, fps)
+	}
 	return nil
 }
 
@@ -713,7 +838,11 @@ func (s *Sharer) SetPaused(on bool) {
 
 // blackFrame 返回一帧纯黑画面（按当前采集区域尺寸）。
 func (s *Sharer) blackFrame() capture.Frame {
-	r := s.src.Load().Region()
+	src := s.src.Load()
+	if src == nil {
+		return capture.Frame{}
+	}
+	r := src.Region()
 	n := r.W * r.H * 4
 	if n <= 0 {
 		return capture.Frame{}
@@ -733,7 +862,9 @@ func (s *Sharer) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.stats
-	st.Stats = s.src.Load().Stats()
+	if src := s.src.Load(); src != nil {
+		st.Stats = src.Stats()
+	}
 	if st.Frames > 0 {
 		st.EncodeMs /= float64(st.Frames)
 	}
@@ -769,6 +900,17 @@ func (s *Sharer) Run(ctx context.Context) error {
 		if q := int(s.adapt.wantQuality.Load()); q > 0 && q != s.enc.Config().Quality {
 			s.enc.SetQuality(q)
 		}
+		// 采集源可能正在被重建（换区域/换屏，且帧率需要跟着变）：这期间短暂没有源，
+		// 观众看到的是上一帧（不会黑），等新源就绪即可。
+		src := s.src.Load()
+		if src == nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(20 * time.Millisecond):
+			}
+			continue
+		}
 		if s.Paused() {
 			// 暂停期间不检测黑屏：黑帧是自己发的，与采集是否可用无关。
 			s.blackStreak.Store(0)
@@ -779,18 +921,18 @@ func (s *Sharer) Run(ctx context.Context) error {
 			}
 			// 仍要用带超时的等待，否则 ctx 取消要等到下一次桌面变化才响应。
 			c, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-			_, _ = s.src.Load().WaitFrame(c)
+			_, _ = src.WaitFrame(c)
 			cancel()
 			continue
 		}
-		f, err := s.src.Load().WaitFrame(ctx)
+		f, err := src.WaitFrame(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			// 等待超时 = 桌面没变化。发一次保活心跳，让观众端知道连接还活着。
 			if time.Since(lastBeat) >= s.cfg.IdleHeartbeat && s.PeerCount() > 0 {
-				if hb := s.src.Load().Last(); !hb.Empty() {
+				if hb := src.Last(); !hb.Empty() {
 					_ = s.emit(hb)
 					s.mu.Lock()
 					s.stats.Heartbeat++

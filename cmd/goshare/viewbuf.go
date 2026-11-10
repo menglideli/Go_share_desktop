@@ -19,10 +19,11 @@ import (
 	"goshare/internal/codec"
 )
 
-// dispBufN 是池子大小：一块在界面上、一块在解码侧、最多三块在播放队列里等 due
-//（见 playout.go），再留一块余量。少给一块的后果不是"慢"，而是池子被占满后
+// dispBufN 是池子**上限**：界面 1 + 播放队列最多 6（见 playout.go）+ 解码侧余量。
+// 缓冲是按需分配的（pick 里不够才建），所以 30fps/2K 实际只用 3~4 块，
+// 只有"流畅60"档才会接近上限。少给一块的后果不是"慢"，而是池子被占满后
 // 每帧走整帧拷贝兜底 —— 2K 下那就是每帧多 20MB 的搬运。
-const dispBufN = 5
+const dispBufN = 8
 
 // dispBuf 是一块可复用的画面缓冲。
 type dispBuf struct {

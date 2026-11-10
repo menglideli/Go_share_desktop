@@ -26,8 +26,10 @@ import (
 
 // playoutDepth 是"等上屏"队列的深度上限。
 //
-// 3 的依据：D=80ms / 30fps ≈ 2.4 帧。再多只会在拥塞时变成额外延迟。
-const playoutDepth = 3
+// 取 6：D=80ms 在 30fps 下只铺得开 2.4 帧，但"流畅60"档真的会采集 60fps，
+// 那时同样 80ms 里有 4.8 帧 —— 深度 3 会把多出来的帧当"队列满"丢掉
+// （画面看着像掉帧）。6 同时覆盖两种情况；队列没满时不会多占内存。
+const playoutDepth = 6
 
 // playoutItem 是一帧"已解码、等着按统一时间线上屏"的画面。
 type playoutItem struct {

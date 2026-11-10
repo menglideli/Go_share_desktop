@@ -66,6 +66,9 @@ func main() {
 	// 也是产品上的调优旋钮。
 	switchAt := flag.Duration("switch-at", 0, "分享开始 N 秒后热切换采集区域（自动化验证用，0 = 不切）")
 	switchRegion := flag.String("switch-region", "", "热切换到的区域，格式 宽x高+左+上（如 800x600+100+100）")
+	// 初始分享区域：和 -switch-region 同一套格式。放在启动参数里是为了让
+	// "一开始就分享小区域"这条路径可测（-switch 会重建采集源，测不出初始设置）。
+	startRegion := flag.String("region", "", "初始分享区域，格式 宽x高+左+上（空 = 整屏）")
 	switchDisp := flag.Int("switch-display", -1, "分享开始 N 秒后热切换到第 N 台显示器（配合 -switch-at，-1 = 不换屏）")
 	keyInterval := flag.Duration("key-interval", 0, "稳态周期性全量帧间隔（0/负值=禁用，靠观众请求恢复）")
 	keyBurst := flag.Duration("key-burst", 3*time.Second, "新观众接入后的密集补帧窗口（负值禁用）")
@@ -75,6 +78,9 @@ func main() {
 	// 条带粒度的调优旋钮（默认用档位里的 32px）。调参会直接影响码率与丢包放大，
 	// 用 cmd/tilebench 先量再改：-1 = 档位默认，0 = 按 CPU 核数。
 	tileH := flag.Int("tile-h", -1, "分享端条带高度（像素）：-1 = 档位默认，0 = 按 CPU 核数")
+	// 采集帧率的覆盖项（0 = 按档位自动）。"流畅60"在 1080p 下会真的采集 60fps，
+	// 2K 自动回落 30（编码余量不够）。
+	fps := flag.Int("fps", 0, "采集目标帧率（0 = 按档位自动）")
 	flag.Parse()
 
 	if *logPath != "" {
@@ -112,10 +118,12 @@ func main() {
 		dumpPath: *dumpFrame, dumpAt: *dumpAt,
 		keyInterval: *keyInterval, keyBurst: *keyBurst,
 		switchAt: *switchAt, switchRegion: *switchRegion,
-		switchDisp: *switchDisp, displays: ds,
+		startRegion: *startRegion,
+		switchDisp:  *switchDisp, displays: ds,
 		disp:      newDispPool(),
 		playoutMS: *playoutMS,
 		tileH:     *tileH,
+		fps:       *fps,
 	}
 	a.clock = &rtc.Clock{}
 	a.pl = newPlayout(a.disp.Recycle())
@@ -315,6 +323,8 @@ type app struct {
 	// （见 -switch-at / -switch-region）。
 	switchAt     time.Duration
 	switchRegion string
+	// startRegion 是初始分享区域（-region），空 = 整屏。
+	startRegion string
 	// switchDisp：自动化验证用，分享开始后热切换到另一台显示器（-switch-display）。
 	switchDisp int
 
@@ -342,6 +352,8 @@ type app struct {
 	playoutMS int
 	// tileH 覆盖档位里的目标条带高度（-1 = 用档位默认，0 = 按 CPU 核数，仅供调参）。
 	tileH int
+	// fps 覆盖采集帧率（0 = 按档位与面积自动，见 pipeline.captureFPSFor）。
+	fps int
 	// clock 估计"分享端时钟 - 本端时钟"的偏移（见 internal/rtc/clock.go）。
 	clock *rtc.Clock
 	// pl 是呈现调度器（见 playout.go）。
@@ -488,6 +500,16 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 	name := hostName()
 	shCtx, cancel := context.WithCancel(a.ctx)
 
+	// 初始区域（-region）：必须在 NewSharer 之前定下来，
+	// 否则帧率会按整屏面积算（2K 全屏 30fps），之后再换区域还得重建采集源。
+	if a.startRegion != "" {
+		if r, err := parseRect(a.startRegion, opts.Display); err == nil {
+			opts.Region = r
+		} else {
+			log.Printf("初始区域参数无法解析（%q）：%v", a.startRegion, err)
+		}
+	}
+
 	// 本地回显：分享端自己也要看到在推什么（降采样到 ~960 宽，省 CPU）
 	a.mu.Lock()
 	a.region = opts.Region
@@ -503,6 +525,7 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 	sh, err := pipeline.NewSharer(shCtx, pipeline.Config{
 		Display: opts.Display,
 		Region:  opts.Region,
+		FPS:     a.fps,
 		Preset:  preset,
 		Cursor:  true,
 		// 全量帧补帧策略（R32）：接入窗口内密集补 + 稳态靠观众请求。
@@ -533,6 +556,15 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 	if err != nil {
 		cancel()
 		return err
+	}
+	// P0-2：把"实际采集帧率"说清楚。档位要 60 但面积太大时会被回落，
+	// 不打印原因的话用户只会觉得"选了 60 还是不流畅"。
+	if want := preset.MaxFPS; want > 0 && sh.CaptureFPS() < want {
+		log.Printf("采集帧率回落：档位 %s 要 %d fps，但采集面积太大（%dx%d），按 %d fps 运行 —— "+
+			"60fps 只在 1080p 及更小的画面上可行", preset.Name, want,
+			opts.Display.W, opts.Display.H, sh.CaptureFPS())
+	} else {
+		log.Printf("采集帧率 %d fps（档位 %s）", sh.CaptureFPS(), preset.Name)
 	}
 
 	srv, err := signal.NewServer(signal.ServerConfig{
@@ -918,8 +950,9 @@ func (a *app) pushShareState() {
 	tick := a.hudTicks
 	a.mu.Unlock()
 	if tick%6 == 0 {
-		log.Printf("分享统计：%.1f fps · 出网 %.2f Mbps（单路 %.2f × %d 人）· 编码均值 %.1f ms · 预览 %.1f ms · 全量帧 %d/%d · 观众 %d 人",
-			fps, outMbps, mbps, len(rows), encAvg, float64(a.previewUs.Load())/1000, st.Keys, st.Frames, len(rows))
+		log.Printf("分享统计：%.1f fps（采集 %.1f · 目标 %d）· 出网 %.2f Mbps（单路 %.2f × %d 人）· 编码均值 %.1f ms · 预览 %.1f ms · 全量帧 %d/%d · 观众 %d 人",
+			fps, st.FPS, sh.CaptureFPS(), outMbps, mbps, len(rows), encAvg,
+			float64(a.previewUs.Load())/1000, st.Keys, st.Frames, len(rows))
 		// 多端一致性证据：一条日志里列出每个观众**同一时刻**显示到第几帧。
 		// 所有观众按同一个 `帧 TS + D` 时间线上屏，所以这里的 seq 应当一致（±1）。
 		if synced := syncLine(rows); synced != "" {
