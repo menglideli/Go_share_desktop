@@ -293,6 +293,10 @@ type app struct {
 	wLastSeq atomic.Uint64
 	// disp 是观看端画面缓冲池：复用内存 + 只同步变化过的条带（见 viewbuf.go）。
 	disp *dispPool
+	// wMissTiles 是累计"画布上缺的条带数"（每帧快照求和），wRepairs 是请求修复次数。
+	// 它们是 P3-2 的基础指标：没有"丢了多少、补了几次"，FEC/降分辨率的收益只能靠感觉。
+	wMissTiles atomic.Uint64
+	wRepairs   atomic.Uint64
 	// wSkipped 是"解码跟不上被丢掉"的**分块**数（AsyncFrames 的单槽邮箱覆盖）。
 	// 它不是网络问题，是本地解码产能问题，必须与网络丢块分开看。
 	wSkipped atomic.Uint64
@@ -439,6 +443,7 @@ func (a *app) sendPLI(p *rtc.Peer) {
 		next = int64(pliMaxBackoff / time.Millisecond)
 	}
 	a.pliBackoffMs.Store(next)
+	a.wRepairs.Add(1)
 	if err := p.SendControl(rtc.CtlPLI, nil); err != nil {
 		log.Printf("请求修复失败: %v", err)
 	}
@@ -469,6 +474,7 @@ func (a *app) reportMissing(miss uint64, nTiles int, f *codec.Frame) {
 	if now-last >= gap && a.lastMissingAt.CompareAndSwap(last, now) {
 		a.lastMissingMask.Store(miss)
 		if p := a.peerBox.Load(); p != nil {
+			a.wRepairs.Add(1)
 			if err := p.SendControl(rtc.CtlMissing, rtc.MissingPayload(miss)); err != nil {
 				log.Printf("上报缺失条带失败: %v", err)
 			}
@@ -1464,6 +1470,9 @@ func (a *app) dialOnce(dec *codec.Decoder, addr, code string) (*signal.Session, 
 				// （codec.Decoder.Missing），不再是"收到过全量帧" ——
 				// 新格式下丢一块只丢几条带，缺的那几条是**精确已知**的。
 				miss := dec.Missing()
+				if n := bits.OnesCount64(miss); n > 0 {
+					a.wMissTiles.Add(uint64(n))
+				}
 				complete := miss == 0
 				a.needFull.Store(!complete)
 				if complete {
@@ -1700,6 +1709,8 @@ func (a *app) watchStatusLoop(dec *codec.Decoder) {
 				freeN, heldN, missN, a.wDispSeq.Load(), a.wDispLate.Load(),
 				func() int32 { o, _ := a.clock.Offset(); return o }(), a.wSyncRTT.Load(),
 				a.pl.dropped.Load(), a.cur.summary())
+			log.Printf("观看质量：缺块累计 %d 条带 · 修复请求 %d 次 · 解码跳块 %d · 坏块 %d",
+				a.wMissTiles.Load(), a.wRepairs.Load(), a.wSkipped.Load(), ps.BadChunks)
 		}
 	}
 }
