@@ -140,7 +140,10 @@ func (c *cursorLayer) summary() string {
 	if c.n == 0 {
 		return "光标流 未收到"
 	}
-	return fmt.Sprintf("光标流 采样%d 形状#%x", c.n, c.shapeID)
+	s := c.samples[(c.next-1+cursorSampleCap)%cursorSampleCap]
+	// 图像坐标 = 热点绝对坐标 - 区域原点 - 热点偏移（判据就是它落在画面里）。
+	imgX, imgY := int(s.x-s.rx)-c.hot.X, int(s.y-s.ry)-c.hot.Y
+	return fmt.Sprintf("光标流 采样%d 形状#%x 图像坐标(%d,%d) 可见=%v", c.n, c.shapeID, imgX, imgY, s.vis)
 }
 
 // cursorOverlay 返回"此刻该画的光标"（ui.Shell 每帧渲染时调用）。
