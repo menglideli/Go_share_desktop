@@ -408,6 +408,13 @@ func (p *Peer) WaitReady(timeout time.Duration) error {
 	return errors.New("rtc: 等待媒体通道就绪超时")
 }
 
+// pacing 参数（P1-4）：每 paceChunks 块之间停 paceDelay。
+// 取值保守：只削峰，不试图量化成"目标码率"（那需要实时带宽估计，容易反向放大延迟）。
+const (
+	paceChunks = 8
+	paceDelay  = time.Millisecond
+)
+
 // chunkBatchMax 是"攒一批"的上限（块）。
 //
 // 取 4：太小则并行度不够（单块只有 1~2 个条带），太大则邮箱里会压出额外延迟
@@ -460,9 +467,15 @@ func (p *Peer) SendChunks(chunks [][]byte) error {
 		p.mu.Unlock()
 		return ErrBackpressure
 	}
-	for _, c := range chunks {
+	// pacing（P1-4）：把一帧的分块铺开一点发，避免"一口气 2MB"在 Wi-Fi 上
+	// 造成瞬时排队/丢包。只治抖动，不省流量；总字节不变。
+	// 每 paceChunks 块停 paceDelay：2K 全量 35 块 ≈ +4ms，增量帧通常 1~3 块不受影响。
+	for i, c := range chunks {
 		if err := m.Send(c); err != nil {
 			return err
+		}
+		if paceDelay > 0 && (i+1)%paceChunks == 0 && i+1 < len(chunks) {
+			time.Sleep(paceDelay)
 		}
 	}
 	p.mu.Lock()
