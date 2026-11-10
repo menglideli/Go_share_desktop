@@ -232,6 +232,9 @@ type Sharer struct {
 	// cursorOn 为 true 表示"所有观众都能自己合成光标"，此时不再画进帧，
 	// 改走 ctl 的 60Hz 光标流（见 cursorLoop）。
 	cursorOn atomic.Bool
+	// scalePct 是编码前的降采样比例（P1-5）：100 = 不缩放，67 = 2/3，50 = 1/2。
+	// 降采样发生在编码前，所以带宽和编码 CPU 一起降；观众端画布按新尺寸重建。
+	scalePct atomic.Int32
 	// latest 是扇出共享缓存：最近一帧的线格式数据（见 wireFrame 注释）。
 	latest atomic.Pointer[wireFrame]
 	// wantKey 表示下一位观众（或全部观众）需要全量帧
@@ -394,6 +397,20 @@ func (s *Sharer) adaptLoop(ctx context.Context) {
 	}
 }
 
+// scaleCursor 把光标位图按百分比缩小（热点同比）。id 带上比例，
+// 这样同一形状在不同比例下观看端不会命中旧缓存。
+func scaleCursor(c rtc.CursorShape, pct int) (rtc.CursorShape, bool) {
+	pix, w, h, err := codec.DownscaleBGRA(c.Pix, c.W, c.H, pct, 100)
+	if err != nil || w <= 0 || h <= 0 {
+		return c, false
+	}
+	return rtc.CursorShape{
+		ID: c.ID ^ uint32(pct)<<24, W: w, H: h,
+		HotX: c.HotX * pct / 100, HotY: c.HotY * pct / 100,
+		Pix: pix,
+	}, true
+}
+
 // shouldDegrade 判断这一秒的压力是否足以触发全局降档（P0-4）。
 //
 // 规则：只有 1 个观众时保持旧行为（他有压力就降）；多观众时必须**过半**有压力
@@ -515,9 +532,21 @@ func NewSharer(ctx context.Context, cfg Config) (*Sharer, error) {
 		sh.fpsExplicit = cfg.FPS
 	}
 	sh.fps.Store(int32(cfg.FPS))
+	sh.scalePct.Store(100)
 	sh.src.Store(src)
 	return sh, nil
 }
+
+// SetScale 设置编码前的降采样比例（100 = 不缩放）。P1-5。
+func (s *Sharer) SetScale(pct int) {
+	if pct <= 0 || pct > 100 {
+		pct = 100
+	}
+	s.scalePct.Store(int32(pct))
+}
+
+// Scale 返回当前降采样比例（百分数）。
+func (s *Sharer) Scale() int { return int(s.scalePct.Load()) }
 
 // CaptureFPS 返回当前实际使用的采集目标帧率（启动日志/HUD 用）。
 func (s *Sharer) CaptureFPS() int { return int(s.fps.Load()) }
@@ -866,12 +895,20 @@ func (s *Sharer) cursorLoop(ctx context.Context) {
 			continue
 		}
 		x, y, vis := capture.CursorPos()
+		pct := s.Scale()
 		h := uint64(capture.CursorHandle())
 		// 形状变化才解码位图（解码要读 GDI 位图，不能 60Hz 做）。
 		if vis && h != lastHandle {
 			lastHandle = h
 			if id, w, hh, hotX, hotY, pix, ok := capture.CursorBitmap(); ok && w > 0 && hh > 0 {
 				curShape = rtc.CursorShape{ID: id, W: w, H: hh, HotX: hotX, HotY: hotY, Pix: pix}
+				// P1-5：画面被降采样时，光标位图与热点也要同比缩小，
+				// 否则观看端会把一个"原尺寸"的光标画在缩小的画面上（显得巨大）。
+				if pct > 0 && pct < 100 {
+					if sp, ok := scaleCursor(curShape, pct); ok {
+						curShape = sp
+					}
+				}
 				haveShape = true
 				sendShape(peers) // 形状立刻发；观看端按 id 缓存
 			}
@@ -892,13 +929,17 @@ func (s *Sharer) cursorLoop(ctx context.Context) {
 		s.mu.Lock()
 		d := s.curDisplay
 		s.mu.Unlock()
+		// 坐标直接换算到**图像坐标**（降采样后的画面）：观看端只做减法，
+		// 不需要知道缩放比例 —— 这样降分辨率不必改 ctl 线格式。
+		sx := int64(x-(d.X+r.X)) * int64(pct) / 100
+		sy := int64(y-(d.Y+r.Y)) * int64(pct) / 100
 		pos := rtc.CursorPos{
 			TS:  uint32(time.Now().UnixMilli()),
 			ID:  curShape.ID,
-			X:   int32(x),
-			Y:   int32(y),
-			RX:  int32(d.X + r.X),
-			RY:  int32(d.Y + r.Y),
+			X:   int32(sx),
+			Y:   int32(sy),
+			RX:  0,
+			RY:  0,
 			Vis: vis && haveShape,
 		}
 		msg := rtc.MarshalCursorPos(pos)
@@ -1281,6 +1322,11 @@ func (s *Sharer) emit(f capture.Frame) error {
 			s.mu.Lock()
 			s.lastKeyAt = time.Now()
 			s.mu.Unlock()
+		}
+	}
+	if pct := int(s.scalePct.Load()); pct > 0 && pct < 100 {
+		if small, ow, oh, err := codec.DownscaleBGRA(f.Pix, f.W, f.H, pct, 100); err == nil {
+			f.Pix, f.W, f.H = small, ow, oh
 		}
 	}
 	out, err := enc.Encode(f.Pix, f.W, f.H)

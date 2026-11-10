@@ -86,6 +86,8 @@ func main() {
 	noCursorCap := flag.Bool("no-cursor-cap", false, "观看端：不声明光标能力（模拟旧版，验证兼容）")
 	// P1-2：跟随并分享一个窗口（标题子串匹配）。
 	windowTitle := flag.String("window", "", "跟随分享一个窗口（标题子串，如 \"Visual Studio Code\"）")
+	// P1-5 的降采样旋钮：先手动验证效果，自适应阶梯之后接上。
+	scalePct := flag.Int("scale", 100, "编码前降采样比例（100 = 不缩放，67 = 2/3，50 = 1/2）")
 	flag.Parse()
 
 	if *logPath != "" {
@@ -132,6 +134,7 @@ func main() {
 		cur:         &cursorLayer{},
 		noCursor:    *noCursorCap,
 		windowTitle: *windowTitle,
+		scalePct:    *scalePct,
 	}
 	a.clock = &rtc.Clock{}
 	a.pl = newPlayout(a.disp.Recycle())
@@ -375,6 +378,8 @@ type app struct {
 	noCursor bool
 	// windowTitle 非空时跟随并分享该窗口（-window，P1-2）。
 	windowTitle string
+	// scalePct 是编码前降采样比例（-scale，P1-5）。
+	scalePct int
 	// clock 估计"分享端时钟 - 本端时钟"的偏移（见 internal/rtc/clock.go）。
 	clock *rtc.Clock
 	// pl 是呈现调度器（见 playout.go）。
@@ -611,6 +616,10 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 	// 跟随窗口：区域已按当前位置设好，这里只启动轮询（移动/缩放时自动跟）。
 	if followHandle != 0 {
 		sh.FollowWindow(followHandle)
+	}
+	if a.scalePct > 0 && a.scalePct < 100 {
+		sh.SetScale(a.scalePct)
+		log.Printf("编码前降采样：%d%%（画面 %dx%d 会按此比例缩小）", a.scalePct, opts.Display.W, opts.Display.H)
 	}
 	// P0-2：把"实际采集帧率"说清楚。档位要 60 但面积太大时会被回落，
 	// 不打印原因的话用户只会觉得"选了 60 还是不流畅"。
