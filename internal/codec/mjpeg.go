@@ -110,6 +110,9 @@ type Frame struct {
 	Full       bool   // 整个逻辑帧是否包含全部条带（首帧 / 强制关键帧 / 变化过大）
 	// FEC 表示这一帧后面会跟 XOR 校验块（P1-7）：接收端据此保留分块以便恢复丢块。
 	FEC bool
+	// Shift 是整帧的竖直位移（P2-1，正数 = 内容下移 N 行）。非 0 时接收端先把
+	// 画布滚动 N 行，再贴本帧携带的条带（通常只有新露出的那几条）。
+	Shift int16
 	// TilesMask 是逻辑帧的条带集合位图（bit i = 条带 i 在本帧内）。
 	// 每块里都写同一份 —— 这样任一块到达都能告诉接收端"还缺哪些"。
 	TilesMask uint64
@@ -531,7 +534,7 @@ func tileChanged(cur, prev []byte, w, h, y0, y1 int) bool {
 // 「双方版本不一致，请把两台机器都升级到同一版本」。
 //
 // 历史：1 = GSJ1（整帧一个消息、按字节切块）；2 = GSJ2（每块自带帧头 + 完整条带）。
-const ProtoVersion = 3
+const ProtoVersion = 4
 
 // ---------------------------------------------------------------------------
 // Wire 格式
@@ -562,8 +565,8 @@ const ProtoVersion = 3
 //	   8 ..    JPEG 数据
 
 const (
-	frameHeaderLen = 36
-	tileHeaderLen  = 9 // idx(2) y0(2) enc(1) len(4)
+	frameHeaderLen = 38 // 36 + shift(int16，P2-1)
+	tileHeaderLen  = 9  // idx(2) y0(2) enc(1) len(4)
 	flagFull       = 1 << 0
 	// flagFEC 表示"这一帧带 FEC 校验块"。旧端不认识这个位，只是忽略（不影响解析）。
 	flagFEC = 1 << 1
@@ -613,6 +616,7 @@ func (f *Frame) Marshal() ([]byte, error) {
 	if f.FEC {
 		buf[24] |= flagFEC
 	}
+	binary.BigEndian.PutUint16(buf[36:38], uint16(f.Shift))
 	buf[25] = f.Refresh
 	buf[26] = f.ChunkIdx
 	buf[27] = f.ChunkTotal
@@ -704,6 +708,7 @@ func UnmarshalFrame(buf []byte) (*Frame, error) {
 	}
 	f.Full = buf[24]&flagFull != 0
 	f.FEC = buf[24]&flagFEC != 0
+	f.Shift = int16(binary.BigEndian.Uint16(buf[36:38]))
 	f.Refresh = buf[25]
 	f.ChunkIdx = buf[26]
 	f.ChunkTotal = buf[27]
@@ -849,6 +854,10 @@ func (d *Decoder) DecodeBatch(frames []*Frame) (*image.NRGBA, error) {
 		// 一帧收尾：上一帧"该到没到"的条带内容已过期 → 清位（修复会补）。
 		if f.Seq != d.curSeq {
 			d.have &^= d.curExpect &^ d.curGot
+			// P2-1：整帧位移。先滚画布，再贴本帧的条带（通常只有新露出的那几条）。
+			if f.Shift != 0 && d.have != 0 && d.img != nil {
+				scrollCanvas(d.img, int(f.Shift))
+			}
 			d.curSeq, d.curExpect, d.curGot = f.Seq, 0, 0
 		}
 		// 乱序保护：太旧的分块直接丢（否则旧内容会盖掉新画面）。
@@ -933,6 +942,21 @@ func fillTile(dst []byte, stride, w int, r, g, b byte, y0, y1 int) {
 			i := row + x*4
 			dst[i], dst[i+1], dst[i+2], dst[i+3] = r, g, b, 255
 		}
+	}
+}
+
+// scrollCanvas 把画布整体竖直滚动 dy 行（正 = 内容下移），露出的部分保持原样
+// 由本帧的条带覆盖。用 copy 做整行搬移，2K 一帧约 2ms。
+func scrollCanvas(img *image.NRGBA, dy int) {
+	h := img.Bounds().Dy()
+	if h <= 0 || dy == 0 || dy >= h || dy <= -h {
+		return
+	}
+	stride := img.Stride
+	if dy > 0 {
+		copy(img.Pix[dy*stride:], img.Pix[:(h-dy)*stride])
+	} else {
+		copy(img.Pix[:], img.Pix[(-dy)*stride:])
 	}
 }
 
