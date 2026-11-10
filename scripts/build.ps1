@@ -29,7 +29,17 @@ go run ./cmd/icon -out winres/icons
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
 Write-Host "== 2/4 Embed Windows resources (icon/version/manifest) ==" -ForegroundColor Cyan
-go run github.com/tc-hib/go-winres@latest make --in winres/winres.json --out cmd/goshare/rsrc
+# P4-4: the version must come from ONE place ($Version).
+# winres.json used to hard-code 0.7.0, so the exe's FileVersion silently drifted
+# from the file name / main.version. Rewrite a temp copy with the real version.
+$wj = Get-Content winres/winres.json -Raw
+$wj = $wj -replace '"file_version": "[0-9.]+"', ('"file_version": "' + $Version + '.0"')
+$wj = $wj -replace '"product_version": "[0-9.]+"', ('"product_version": "' + $Version + '.0"')
+$wj = $wj -replace '"FileVersion": "[0-9.]+"', ('"FileVersion": "' + $Version + '"')
+$wj = $wj -replace '"ProductVersion": "[0-9.]+"', ('"ProductVersion": "' + $Version + '"')
+[IO.File]::WriteAllText("$PWD/winres/winres.generated.json", $wj)
+go run github.com/tc-hib/go-winres@latest make --in winres/winres.generated.json --out cmd/goshare/rsrc
+Remove-Item winres/winres.generated.json -ErrorAction SilentlyContinue
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
 Write-Host "== 3/4 Build single-file exe ==" -ForegroundColor Cyan
