@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test ./...
+
+      # 界面冒烟（粗判据）：逐像素 golden 对字体版本敏感，runner 与本机字体不同时
+      # 会假红，所以 CI 只跑"该画的东西都画出来了"这一层；逐像素回归留在本机跑。
+      - name: UI smoke
+        run: go run ./cmd/uicheck
+
+      # 真实 UDP+ICE+DTLS 回环链路（含丢块恢复与时钟同步）。
+      - name: Netcheck
+        run: go run ./cmd/netcheck
