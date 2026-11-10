@@ -84,6 +84,8 @@ func main() {
 	// 兼容性验证用：关掉"能自己合成光标"的能力声明，模拟旧版观看端
 	// （分享端应继续把光标画进帧，画面里仍有光标）。
 	noCursorCap := flag.Bool("no-cursor-cap", false, "观看端：不声明光标能力（模拟旧版，验证兼容）")
+	// P1-2：跟随并分享一个窗口（标题子串匹配）。
+	windowTitle := flag.String("window", "", "跟随分享一个窗口（标题子串，如 \"Visual Studio Code\"）")
 	flag.Parse()
 
 	if *logPath != "" {
@@ -123,12 +125,13 @@ func main() {
 		switchAt: *switchAt, switchRegion: *switchRegion,
 		startRegion: *startRegion,
 		switchDisp:  *switchDisp, displays: ds,
-		disp:      newDispPool(),
-		playoutMS: *playoutMS,
-		tileH:     *tileH,
-		fps:       *fps,
-		cur:       &cursorLayer{},
-		noCursor:  *noCursorCap,
+		disp:        newDispPool(),
+		playoutMS:   *playoutMS,
+		tileH:       *tileH,
+		fps:         *fps,
+		cur:         &cursorLayer{},
+		noCursor:    *noCursorCap,
+		windowTitle: *windowTitle,
 	}
 	a.clock = &rtc.Clock{}
 	a.pl = newPlayout(a.disp.Recycle())
@@ -365,6 +368,8 @@ type app struct {
 	cur *cursorLayer
 	// noCursor 关闭"光标能力"声明（-no-cursor-cap，模拟旧版观看端）。
 	noCursor bool
+	// windowTitle 非空时跟随并分享该窗口（-window，P1-2）。
+	windowTitle string
 	// clock 估计"分享端时钟 - 本端时钟"的偏移（见 internal/rtc/clock.go）。
 	clock *rtc.Clock
 	// pl 是呈现调度器（见 playout.go）。
@@ -521,6 +526,26 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 		}
 	}
 
+	// 跟随窗口（-window）：区域先按窗口当前位置定下来，之后由 FollowWindow 轮询更新。
+	// 窗口在别的显示器上时，把采集显示器也切过去 —— 否则区域会被 clamp 成一条边。
+	var followHandle uintptr
+	if a.windowTitle != "" {
+		if wi, ok := capture.FindWindowByTitle(a.windowTitle); ok {
+			if d, ok := a.displayAt(wi.X+wi.W/2, wi.Y+wi.H/2); ok {
+				opts.Display = d
+			}
+			opts.Region = capture.Rect{
+				X: wi.X - opts.Display.X, Y: wi.Y - opts.Display.Y,
+				W: wi.W, H: wi.H,
+			}.Clamp(opts.Display)
+			followHandle = wi.Handle
+			log.Printf("跟随窗口：%q %dx%d @ (%d,%d) · 显示器 %s",
+				wi.Title, wi.W, wi.H, wi.X, wi.Y, opts.Display.Name)
+		} else {
+			log.Printf("没找到标题包含 %q 的窗口，按整屏分享", a.windowTitle)
+		}
+	}
+
 	// 本地回显：分享端自己也要看到在推什么（降采样到 ~960 宽，省 CPU）
 	a.mu.Lock()
 	a.region = opts.Region
@@ -567,6 +592,10 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 	if err != nil {
 		cancel()
 		return err
+	}
+	// 跟随窗口：区域已按当前位置设好，这里只启动轮询（移动/缩放时自动跟）。
+	if followHandle != 0 {
+		sh.FollowWindow(followHandle)
 	}
 	// P0-2：把"实际采集帧率"说清楚。档位要 60 但面积太大时会被回落，
 	// 不打印原因的话用户只会觉得"选了 60 还是不流畅"。
@@ -1029,6 +1058,7 @@ func (a *app) stopShare() {
 		_ = srv.Close()
 	}
 	if sh != nil {
+		sh.StopFollow()
 		_ = sh.Close()
 	}
 	if cancel != nil {
@@ -1041,6 +1071,16 @@ func (a *app) stopShare() {
 	if hadSession {
 		log.Printf("分享已停止")
 	}
+}
+
+// displayAt 返回包含该虚拟屏幕坐标点的显示器（-window 选屏用）。
+func (a *app) displayAt(x, y int) (capture.Display, bool) {
+	for _, d := range a.displays {
+		if x >= d.X && x < d.X+d.W && y >= d.Y && y < d.Y+d.H {
+			return d, true
+		}
+	}
+	return capture.Display{}, false
 }
 
 func (a *app) setPaused(on bool) {

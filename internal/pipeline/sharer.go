@@ -224,6 +224,8 @@ type Sharer struct {
 	stats Stats
 	// curDisplay 是当前采集的显示器（SetRegion 重算帧率要用它的尺寸）。
 	curDisplay capture.Display
+	// followStop 用于停止"跟随窗口"的轮询（P1-2）。
+	followStop chan struct{}
 	// cursorOn 为 true 表示"所有观众都能自己合成光标"，此时不再画进帧，
 	// 改走 ctl 的 60Hz 光标流（见 cursorLoop）。
 	cursorOn atomic.Bool
@@ -703,6 +705,87 @@ func (s *Sharer) cursorPeers() []*rtc.Peer {
 
 // CursorStreaming 报告当前是否在走"光标独立传输"。
 func (s *Sharer) CursorStreaming() bool { return s.cursorOn.Load() }
+
+// FollowWindow 让采集区域跟随一个窗口（P1-2）。
+//
+// 为什么要 200ms 轮询而不是 WinEventHook：演示场景里拖窗口/改窗口大小是低频动作，
+// 200ms 的滞后看不出来；而 hook 要处理跨进程消息循环、窗口销毁竞态，
+// 复杂度远高于收益。
+func (s *Sharer) FollowWindow(hwnd uintptr) {
+	s.mu.Lock()
+	if s.followStop != nil {
+		close(s.followStop)
+	}
+	stop := make(chan struct{})
+	s.followStop = stop
+	s.mu.Unlock()
+	go s.followLoop(hwnd, stop)
+}
+
+func (s *Sharer) followLoop(hwnd uintptr, stop chan struct{}) {
+	t := time.NewTicker(200 * time.Millisecond)
+	defer t.Stop()
+	var last capture.Rect
+	for {
+		select {
+		case <-stop:
+			return
+		case <-s.ctx.Done():
+			return
+		case <-t.C:
+		}
+		r, min, ok := capture.WindowRect(hwnd)
+		if !ok {
+			if !s.Paused() {
+				log.Printf("跟随的窗口已关闭，暂停分享")
+				s.SetPaused(true)
+			}
+			return
+		}
+		if min {
+			if !s.Paused() {
+				log.Printf("跟随的窗口已最小化，暂停分享")
+				s.SetPaused(true)
+			}
+			continue
+		}
+		if s.Paused() {
+			s.SetPaused(false)
+		}
+		s.mu.Lock()
+		d := s.curDisplay
+		s.mu.Unlock()
+		rel := capture.Rect{X: r.X - d.X, Y: r.Y - d.Y, W: r.W, H: r.H}.Clamp(d)
+		if rel.Empty() {
+			continue
+		}
+		// 4px 的滞回：拖窗口时不要每 200ms 都重建采集源（重建有几百毫秒开销）。
+		if absi(rel.X-last.X) <= 4 && absi(rel.Y-last.Y) <= 4 &&
+			absi(rel.W-last.W) <= 4 && absi(rel.H-last.H) <= 4 {
+			continue
+		}
+		s.SetRegion(rel)
+		log.Printf("跟随窗口：区域 %dx%d @ (%d,%d)", rel.W, rel.H, rel.X, rel.Y)
+		last = rel
+	}
+}
+
+// StopFollow 停止跟随窗口。
+func (s *Sharer) StopFollow() {
+	s.mu.Lock()
+	if s.followStop != nil {
+		close(s.followStop)
+		s.followStop = nil
+	}
+	s.mu.Unlock()
+}
+
+func absi(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
 
 // cursorLoop 以 ~60Hz 发光标位置（形状变化时补发位图）。
 //
