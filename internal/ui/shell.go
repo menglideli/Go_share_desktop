@@ -220,6 +220,8 @@ type Shell struct {
 	winSel     int
 	winBtns    []widget.Clickable
 	btnWinRef  widget.Clickable
+	// winList 是"跟随窗口"列表的内部滚动区：窗口再多也不能把「开始分享」顶出屏幕。
+	winList widget.List
 	// panelList 让分享中面板的"信息区"可滚动：观众一多面板就超高，
 	// 不滚动的话底部的"停止分享"会被推出窗口（实测 780 高窗口 + 2 个观众就放不下）。
 	panelList widget.List

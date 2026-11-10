@@ -416,39 +416,44 @@ func (s *Shell) pageSetup(gtx layout.Context, th *material.Theme) layout.Dimensi
 				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 						return s.section(gtx, th, "跟随窗口（可选）", func(gtx layout.Context) layout.Dimensions {
-							children := make([]layout.FlexChild, 0, len(s.windowRows)+1)
-							for i, w := range s.windowRows {
-								i, w := i, w
-								if i >= len(s.winBtns) {
-									break
-								}
-								label := w.Title
-								if len([]rune(label)) > 32 {
-									label = string([]rune(label)[:32]) + "…"
-								}
-								if s.winSel == i {
-									label = "✓ " + label
-								}
-								children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									b := material.Button(th, &s.winBtns[i], label)
-									b.Background = colPanel
-									b.Color = colText
-									b.CornerRadius = unit.Dp(6)
-									b.TextSize = unit.Sp(12)
-									b.Inset = layout.UniformInset(unit.Dp(5))
-									return b.Layout(gtx)
-								}))
-								children = append(children, layout.Rigid(vSpace(4)))
-							}
+							var rows []layout.Widget
 							if len(s.windowRows) == 0 {
 								l := material.Body2(th, "没有可分享的窗口")
 								l.Color = colDim
-								children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									return l.Layout(gtx)
-								}))
+								rows = append(rows, func(gtx layout.Context) layout.Dimensions { return l.Layout(gtx) })
+							} else {
+								// 内部滚动区：最多 140dp 高，窗口再多也只在这里滚。
+								// 整页高度因此固定，窗口化时「开始分享」不会再被顶出屏幕。
+								rows = append(rows, func(gtx layout.Context) layout.Dimensions {
+									h := gtx.Dp(unit.Dp(34)) * len(s.windowRows)
+									if maxH := gtx.Dp(unit.Dp(140)); h > maxH {
+										h = maxH
+									}
+									gtx.Constraints = layout.Exact(image.Pt(gtx.Constraints.Max.X, h))
+									return s.winList.Layout(gtx, len(s.windowRows), func(gtx layout.Context, i int) layout.Dimensions {
+										if i >= len(s.winBtns) || i >= len(s.windowRows) {
+											return layout.Dimensions{}
+										}
+										label := s.windowRows[i].Title
+										if len([]rune(label)) > 40 {
+											label = string([]rune(label)[:40]) + "…"
+										}
+										if s.winSel == i {
+											label = "✓ " + label
+										}
+										b := material.Button(th, &s.winBtns[i], label)
+										b.Background = colPanel
+										b.Color = colText
+										b.CornerRadius = unit.Dp(6)
+										b.TextSize = unit.Sp(12)
+										b.Inset = layout.UniformInset(unit.Dp(5))
+										gtx.Constraints.Min.X = gtx.Constraints.Max.X
+										return b.Layout(gtx)
+									})
+								})
 							}
-							children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-								return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+							rows = append(rows, func(gtx layout.Context) layout.Dimensions {
+								return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 										b := material.Button(th, &s.btnWinRef, "刷新窗口")
 										b.Background = colBG
@@ -458,17 +463,15 @@ func (s *Shell) pageSetup(gtx layout.Context, th *material.Theme) layout.Dimensi
 										b.Inset = layout.UniformInset(unit.Dp(4))
 										return b.Layout(gtx)
 									}),
-									layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+									layout.Rigid(hSpace(8)),
+									layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 										l := material.Caption(th, "选中后分享区域会跟着窗口走")
 										l.Color = colDim
-										return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-											layout.Rigid(func(gtx layout.Context) layout.Dimensions { return layout.Dimensions{Size: image.Pt(8, 0)} }),
-											layout.Rigid(func(gtx layout.Context) layout.Dimensions { return l.Layout(gtx) }),
-										)
+										return l.Layout(gtx)
 									}),
 								)
-							}))
-							return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+							})
+							return layout.Flex{Axis: layout.Vertical}.Layout(gtx, widgetChildren(rows)...)
 						})
 					}),
 					layout.Rigid(vSpace(14)),
@@ -1286,6 +1289,16 @@ func (s *Shell) pageRegion(gtx layout.Context, th *material.Theme) layout.Dimens
 			)
 		})
 	})
+}
+
+// widgetChildren 把 []layout.Widget 转成 FlexChild（顺序竖向排列）。
+func widgetChildren(ws []layout.Widget) []layout.FlexChild {
+	out := make([]layout.FlexChild, 0, len(ws))
+	for _, w := range ws {
+		w := w
+		out = append(out, layout.Rigid(w))
+	}
+	return out
 }
 
 // drawCursorOverlay 把远端光标叠在观看画面上（P0-3）。
