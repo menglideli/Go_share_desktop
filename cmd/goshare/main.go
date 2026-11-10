@@ -1120,12 +1120,19 @@ func (a *app) clipboardLoop(ctx context.Context, sh *pipeline.Sharer) {
 	t := time.NewTicker(500 * time.Millisecond)
 	defer t.Stop()
 	last := ""
+	var lastSeq uint32
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
+		// 序号没变就不读：读文本要起 PowerShell（~150ms），不能每 500ms 一次。
+		seq := clip.ClipSeq()
+		if seq == lastSeq {
+			continue
+		}
+		lastSeq = seq
 		text, ok := clip.GetText()
 		if !ok || text == "" || text == last {
 			continue
