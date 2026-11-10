@@ -801,6 +801,30 @@ func (s *Sharer) cursorPeers() []*rtc.Peer {
 	return out
 }
 
+// BroadcastClipboard 把一段文本发给所有观众（P3-1）。
+//
+// 只发文本、单条消息上限 64KB：剪贴板里可能是密码，所以这个能力默认关闭，
+// 由 -clipboard 显式打开。走可靠有序的 ctl，丢不了。
+func (s *Sharer) BroadcastClipboard(text string) int {
+	const maxClip = 64 << 10
+	if len(text) == 0 || len(text) > maxClip {
+		return 0
+	}
+	s.mu.Lock()
+	peers := make([]*rtc.Peer, 0, len(s.peers))
+	for p := range s.peers {
+		peers = append(peers, p)
+	}
+	s.mu.Unlock()
+	n := 0
+	for _, p := range peers {
+		if err := p.SendControl(rtc.CtlClipboard, []byte(text)); err == nil {
+			n++
+		}
+	}
+	return n
+}
+
 // StressCount 返回上一秒有背压的观众数（P0-4，诊断用）。
 func (s *Sharer) StressCount() int { return int(s.bpStress.Load()) }
 

@@ -525,6 +525,8 @@ const (
 	// CtlCursorShape 分享端 → 观众：一个可缓存的鼠标光标位图（P0-3）。
 	// 只在形状变化时发；观看端按 ID 缓存（见 cursor.go）。
 	CtlCursorShape CtlType = 8
+	// CtlClipboard 分享端 → 观众：剪贴板文本（P3-1，UTF-8，≤64KB，默认关闭）。
+	CtlClipboard CtlType = 10
 	// CtlCursorPos 分享端 → 观众：光标位置采样（60Hz，25 字节）。
 	// 它是"静止桌面也能看到鼠标动"的唯一来源 —— 媒体通道此时根本不产帧。
 	CtlCursorPos CtlType = 9

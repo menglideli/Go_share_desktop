@@ -21,6 +21,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"goshare/internal/capture"
+	"goshare/internal/clip"
 	"goshare/internal/codec"
 	"goshare/internal/discover"
 	"goshare/internal/pipeline"
@@ -90,6 +91,8 @@ func main() {
 	scalePct := flag.Int("scale", 100, "编码前降采样比例（100 = 不缩放，67 = 2/3，50 = 1/2）")
 	// P1-7：大帧 XOR 校验。默认开；-no-fec 用于 A/B 测量额外流量。
 	noFEC := flag.Bool("no-fec", false, "关闭大帧 XOR 校验（P1-7，默认开启）")
+	// P3-1：剪贴板同步（默认关闭 —— 剪贴板里可能是密码）。
+	clipboard := flag.Bool("clipboard", false, "剪贴板同步：分享端广播文本，观看端自动写入（默认关闭）")
 	flag.Parse()
 
 	if *logPath != "" {
@@ -138,6 +141,7 @@ func main() {
 		windowTitle: *windowTitle,
 		scalePct:    *scalePct,
 		noFEC:       *noFEC,
+		clipboard:   *clipboard,
 	}
 	a.clock = &rtc.Clock{}
 	a.pl = newPlayout(a.disp.Recycle())
@@ -385,6 +389,10 @@ type app struct {
 	scalePct int
 	// noFEC 关闭大帧 XOR 校验（-no-fec，P1-7 的 A/B 用）。
 	noFEC bool
+	// clipboard 开启剪贴板同步（-clipboard，P3-1）。
+	clipboard bool
+	// lastClip 是最近一次应用的剪贴板文本（用于去重）。
+	lastClip string
 	// clock 估计"分享端时钟 - 本端时钟"的偏移（见 internal/rtc/clock.go）。
 	clock *rtc.Clock
 	// pl 是呈现调度器（见 playout.go）。
@@ -622,6 +630,9 @@ func (a *app) startShare(opts ui.ShareOptions) error {
 	// 跟随窗口：区域已按当前位置设好，这里只启动轮询（移动/缩放时自动跟）。
 	if followHandle != 0 {
 		sh.FollowWindow(followHandle)
+	}
+	if a.clipboard {
+		go a.clipboardLoop(shCtx, sh)
 	}
 	if a.scalePct > 0 && a.scalePct < 100 {
 		sh.SetScale(a.scalePct)
@@ -1104,6 +1115,28 @@ func (a *app) stopShare() {
 	}
 }
 
+// clipboardLoop 每 500ms 看一次剪贴板，变化就广播给观众（P3-1）。
+func (a *app) clipboardLoop(ctx context.Context, sh *pipeline.Sharer) {
+	t := time.NewTicker(500 * time.Millisecond)
+	defer t.Stop()
+	last := ""
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		text, ok := clip.GetText()
+		if !ok || text == "" || text == last {
+			continue
+		}
+		last = text
+		if n := sh.BroadcastClipboard(text); n > 0 {
+			log.Printf("剪贴板已同步给 %d 位观众（%d 字节）", n, len(text))
+		}
+	}
+}
+
 // listWindows 返回可跟随分享的窗口（设置页的"跟随窗口"列表）。
 func (a *app) listWindows() []ui.WindowRow {
 	ws := capture.ListWindows()
@@ -1379,6 +1412,17 @@ func (a *app) dialOnce(dec *codec.Decoder, addr, code string) (*signal.Session, 
 				case rtc.CtlCursorPos:
 					if p, ok := rtc.ParseCursorPos(payload); ok {
 						a.cur.addPos(p)
+					}
+				case rtc.CtlClipboard:
+					// P3-1：把分享端的文本写进本机剪贴板（同一段文本不重复写，
+					// 避免每 500ms 轮询把用户刚复制的内容又顶掉）。
+					if a.clipboard && len(payload) > 0 && string(payload) != a.lastClip {
+						a.lastClip = string(payload)
+						if err := clip.SetText(a.lastClip); err != nil {
+							log.Printf("写入剪贴板失败：%v", err)
+						} else {
+							log.Printf("已同步剪贴板（%d 字节）", len(payload))
+						}
 					}
 				}
 			},
