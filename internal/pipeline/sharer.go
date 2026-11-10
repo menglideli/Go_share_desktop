@@ -202,6 +202,9 @@ type peerSlot struct {
 	// cursor 表示该观众声明了"能自己合成光标"（CtlHello）。它决定分享端
 	// 是否把光标画进帧 —— 只要有一个观众没声明，就必须继续画（P0-3）。
 	cursor bool
+	// drops 是该观众这一秒内的背压丢帧数（P0-4：只有"过半观众有压力"
+	// 才允许全局降档，单个弱观众不该拖累其他人）。adaptLoop 每秒取走清零。
+	drops atomic.Uint64
 }
 
 // Sharer 是一条分享管线：单采集、单编码、扇出给多个观众。
@@ -256,6 +259,8 @@ type Sharer struct {
 	// 而候选信号（积压水位）在突破之前就已经在爬升了。只看丢帧数，用户感受
 	// 就是"都卡成那样了才慢慢降档"。水位是连续量，能让控制器提前一步。
 	bpWatermark atomic.Int64
+	// bpStress 是上一秒"有背压的观众数"（P0-4，日志/诊断用）。
+	bpStress atomic.Int32
 	// adaptMu 保护 adapt 的 level/cleanTicks/lastDown：
 	// adaptLoop（每秒 tick）与 SetPreset（界面 goroutine）都会写。
 	adaptMu sync.Mutex
@@ -367,8 +372,37 @@ func (s *Sharer) adaptLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		s.adaptTick(s.bpDrops.Swap(0), int(s.bpWatermark.Swap(0)))
+		// P0-4：先把丢帧记到各观众头上，再判断"要不要因为压力降档"。
+		// 规则：**过半观众**有压力（或只有 1 个观众）才降；单个弱观众自己跳帧，
+		// 不再连累其他人。水位同理 —— 它只是全局信号，不能反映出是谁堵了。
+		stressed, total := 0, s.PeerCount()
+		s.mu.Lock()
+		for _, slot := range s.peers {
+			if slot.drops.Swap(0) > 0 {
+				stressed++
+			}
+		}
+		s.mu.Unlock()
+		s.bpStress.Store(int32(stressed))
+		drops := s.bpDrops.Swap(0)
+		wm := int(s.bpWatermark.Swap(0))
+		if !shouldDegrade(stressed, total) {
+			// 压力只在少数观众身上：不发降档信号（他们的 sendLoop 会自己跳帧）。
+			drops, wm = 0, 0
+		}
+		s.adaptTick(drops, wm)
 	}
+}
+
+// shouldDegrade 判断这一秒的压力是否足以触发全局降档（P0-4）。
+//
+// 规则：只有 1 个观众时保持旧行为（他有压力就降）；多观众时必须**过半**有压力
+// 才降 —— 否则一个 Wi-Fi 差的观众会连累所有人一起掉质量。
+func shouldDegrade(stressed, total int) bool {
+	if total <= 1 {
+		return true
+	}
+	return stressed*2 >= total
 }
 
 // reportWatermark 记录这一秒内的最高水位（占阈值百分比）。只有 sendLoop 调用。
@@ -703,6 +737,9 @@ func (s *Sharer) cursorPeers() []*rtc.Peer {
 	return out
 }
 
+// StressCount 返回上一秒有背压的观众数（P0-4，诊断用）。
+func (s *Sharer) StressCount() int { return int(s.bpStress.Load()) }
+
 // CursorStreaming 报告当前是否在走"光标独立传输"。
 func (s *Sharer) CursorStreaming() bool { return s.cursorOn.Load() }
 
@@ -891,6 +928,7 @@ func (s *Sharer) sendLoop(p *rtc.Peer, slot *peerSlot) {
 		// 下一次唤醒读到的还是 latest 里最新的那帧，这才是真正的"跳帧不排队"。
 		if buf := p.Buffered(); buf > lim {
 			s.bpDrops.Add(1)
+			slot.drops.Add(1)
 			s.reportWatermark(100)
 			continue
 		}
@@ -904,8 +942,9 @@ func (s *Sharer) sendLoop(p *rtc.Peer, slot *peerSlot) {
 			// 发完再看一次水位：它是"下一秒会不会堵"的先行指标。
 			s.reportWatermark(int(p.Buffered() * 100 / lim))
 		} else if errors.Is(err, rtc.ErrBackpressure) {
-			// 有人顶不住了：喂给自适应控制器（它每秒取走并清零）。
+			// 有人顶不住了：记到**这位观众**头上（P0-4），全局计数只作为汇总。
 			s.bpDrops.Add(1)
+			slot.drops.Add(1)
 		} else if errors.Is(err, rtc.ErrNotOpen) {
 			// 通道还没建好（握手中）：不算发送成功，但 seq 也别推进，
 			// 等下一帧再试 —— 接入期的修复轮次会保证开局完整性。

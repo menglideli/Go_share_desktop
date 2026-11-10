@@ -221,3 +221,28 @@ func TestReportWatermarkKeepsPeak(t *testing.T) {
 		t.Fatalf("水位下界 = %d, 期望 0", got)
 	}
 }
+
+// TestShouldDegrade 钉住 P0-4 的"过半才降档"规则。
+//
+// 为什么值得单测：这条规则决定"一个弱观众会不会拖累全员"。改错方向（比如恒 true）
+// 表现是"多人观看时质量莫名下降"，没有单测就只能靠真机多观众 + 限速才能发现。
+func TestShouldDegrade(t *testing.T) {
+	cases := []struct {
+		stressed, total int
+		want            bool
+	}{
+		{0, 1, true},  // 单人：保持旧行为（调用方只有有压力时才问）
+		{1, 1, true},
+		{0, 2, false},
+		{1, 2, true},  // 一半有压力 → 降
+		{1, 3, false}, // 三分之一 → 不降
+		{2, 3, true},
+		{1, 4, false},
+		{2, 4, true},
+	}
+	for _, c := range cases {
+		if got := shouldDegrade(c.stressed, c.total); got != c.want {
+			t.Errorf("shouldDegrade(%d,%d) = %v，期望 %v", c.stressed, c.total, got, c.want)
+		}
+	}
+}

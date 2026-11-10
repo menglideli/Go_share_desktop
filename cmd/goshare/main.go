@@ -1002,9 +1002,9 @@ func (a *app) pushShareState() {
 	tick := a.hudTicks
 	a.mu.Unlock()
 	if tick%6 == 0 {
-		log.Printf("分享统计：%.1f fps（采集 %.1f · 目标 %d）· 出网 %.2f Mbps（单路 %.2f × %d 人）· 编码均值 %.1f ms · 预览 %.1f ms · 全量帧 %d/%d · 观众 %d 人",
+		log.Printf("分享统计：%.1f fps（采集 %.1f · 目标 %d）· 出网 %.2f Mbps（单路 %.2f × %d 人）· 编码均值 %.1f ms · 预览 %.1f ms · 压力 %d/%d 人 · 全量帧 %d/%d · 观众 %d 人",
 			fps, st.FPS, sh.CaptureFPS(), outMbps, mbps, len(rows), encAvg,
-			float64(a.previewUs.Load())/1000, st.Keys, st.Frames, len(rows))
+			float64(a.previewUs.Load())/1000, sh.StressCount(), len(rows), st.Keys, st.Frames, len(rows))
 		// 多端一致性证据：一条日志里列出每个观众**同一时刻**显示到第几帧。
 		// 所有观众按同一个 `帧 TS + D` 时间线上屏，所以这里的 seq 应当一致（±1）。
 		if synced := syncLine(rows); synced != "" {
