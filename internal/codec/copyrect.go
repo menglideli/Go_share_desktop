@@ -69,3 +69,11 @@ func DetectShift(prevH, curH []uint64, maxShift, step int) (dy int, ratio float6
 	}
 	return bestDy * step, float64(bestHit) / float64(n), bestHit > 0
 }
+
+// absi 是包内小工具（避免为一行取绝对值引入 import）。
+func absi(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}

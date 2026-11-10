@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"image"
 	"image/jpeg"
 	"log"
@@ -148,6 +149,8 @@ type Encoder struct {
 	// pendingTiles 是观众端"点名"要补的条带位图（见 RequestTiles）。
 	// 只在编码 goroutine 里读写。
 	pendingTiles uint64
+	// shift 是本次编码检出的整帧竖直位移（P2-1），写进 Frame.Shift。
+	shift int16
 }
 
 // NewEncoder 创建编码器。初始尺寸未知，首次 Encode 时按帧尺寸初始化。
@@ -288,6 +291,15 @@ func (e *Encoder) Encode(bgra []byte, w, h int) (*Frame, error) {
 	BGRAtoI420(e.i420, bgra, w, h, e.cfg.Workers)
 
 	full := !e.cfg.Dirty || !e.havePrev
+	e.shift = 0
+	// P2-1：先看整帧是不是"只是上下滚了一下"。命中就把参考帧一起滚动，
+	// 之后的脏检测自然只剩"新露出的那几条带"。
+	if !full && e.havePrev && h == e.h && e.nTiles > 0 {
+		if dy, ratio, ok := detectYShift(e.prev, e.i420, w, h); ok && ratio >= 0.85 && absi(dy) >= 2 {
+			shiftI420(e.prev, w, h, dy)
+			e.shift = int16(dy)
+		}
+	}
 	var dirty []int
 	if full {
 		dirty = make([]int, e.nTiles)
@@ -317,6 +329,11 @@ func (e *Encoder) Encode(bgra []byte, w, h int) (*Frame, error) {
 			// 渐进式修复：本帧额外轮转 repairStep 个条带（不管它们有没有变化）。
 			if e.repairLeft > 0 {
 				dirty = e.addRepairTiles(dirty)
+			}
+			// 位移后新露出的那几条带必须重编：滚动后的参考内容在那里是"旧画面的边缘"，
+			// 万一恰好相同就会漏发，观众看到错位的残影。
+			if e.shift != 0 {
+				dirty = addShiftBand(dirty, e.nTiles, int(e.shift), e.tileH, h)
 			}
 		}
 	}
@@ -413,6 +430,7 @@ func (e *Encoder) Encode(bgra []byte, w, h int) (*Frame, error) {
 		Refresh:    e.refresh,
 		ChunkIdx:   0,
 		ChunkTotal: 1,
+		Shift:      e.shift,
 		TS:         time.Now().UnixMilli(),
 		EncodeMs:   float64(time.Since(t0).Microseconds()) / 1000.0,
 		Bytes:      total,
@@ -668,7 +686,7 @@ func (f *Frame) Split(maxPayload int) []*Frame {
 			*cur = Frame{
 				Seq: f.Seq, W: f.W, H: f.H, TileH: f.TileH, TotalTiles: f.TotalTiles,
 				Full: f.Full, TilesMask: f.TilesMask, Refresh: f.Refresh,
-				TS: f.TS, EncodeMs: f.EncodeMs,
+				Shift: f.Shift, TS: f.TS, EncodeMs: f.EncodeMs,
 			}
 		}
 		cur.Tiles = append(cur.Tiles, t)
@@ -943,6 +961,81 @@ func fillTile(dst []byte, stride, w int, r, g, b byte, y0, y1 int) {
 			dst[i], dst[i+1], dst[i+2], dst[i+3] = r, g, b, 255
 		}
 	}
+}
+
+// detectYShift 在 I420 的 Y 平面上找竖直位移（4 行抽样，2K 约 0.1ms）。
+func detectYShift(prev, cur []byte, w, h int) (dy int, ratio float64, ok bool) {
+	const step = 4
+	ph := yPlaneHashes(prev, w, h, step)
+	ch := yPlaneHashes(cur, w, h, step)
+	return DetectShift(ph, ch, 64, step)
+}
+
+func yPlaneHashes(pix []byte, w, h, step int) []uint64 {
+	if w <= 0 || h <= 0 || len(pix) < w*h || step < 1 {
+		return nil
+	}
+	hsh := fnv.New64a()
+	out := make([]uint64, 0, h/step+1)
+	for y := 0; y < h; y += step {
+		hsh.Reset()
+		_, _ = hsh.Write(pix[y*w : (y+1)*w])
+		out = append(out, hsh.Sum64())
+	}
+	return out
+}
+
+// shiftI420 把 I420 缓冲整体竖直滚动 dy 行（正 = 内容下移）。
+// Y 平面滚 dy 行，U/V 是半分辨率，滚 dy/2 行（奇数时向下取整，误差 <1 色度像素）。
+func shiftI420(buf []byte, w, h, dy int) {
+	ys := w * h
+	if ys <= 0 || ys > len(buf) {
+		return
+	}
+	shiftRows := func(plane []byte, pw, phh, d int) {
+		if d == 0 || d >= phh || d <= -phh {
+			return
+		}
+		if d > 0 {
+			copy(plane[d*pw:], plane[:(phh-d)*pw])
+		} else {
+			copy(plane[:], plane[(-d)*pw:])
+		}
+	}
+	shiftRows(buf[:ys], w, h, dy)
+	cw, chh := w/2, h/2
+	if 2+cw*chh <= len(buf)-ys {
+		chroma := buf[ys : ys+2*cw*chh]
+		shiftRows(chroma[:cw*chh], cw, chh, dy/2)
+		shiftRows(chroma[cw*chh:], cw, chh, dy/2)
+	}
+}
+
+// addShiftBand 把滚动新露出的那几条带标脏。
+func addShiftBand(dirty []int, nTiles, dy, tileH, h int) []int {
+	if dy == 0 || nTiles <= 0 {
+		return dirty
+	}
+	band := (absi(dy) + tileH - 1) / tileH
+	if band > nTiles {
+		band = nTiles
+	}
+	seen := make([]bool, nTiles)
+	for _, d := range dirty {
+		if d >= 0 && d < nTiles {
+			seen[d] = true
+		}
+	}
+	for i := 0; i < band; i++ {
+		idx := i
+		if dy < 0 {
+			idx = nTiles - 1 - i
+		}
+		if !seen[idx] {
+			dirty = append(dirty, idx)
+		}
+	}
+	return dirty
 }
 
 // scrollCanvas 把画布整体竖直滚动 dy 行（正 = 内容下移），露出的部分保持原样
