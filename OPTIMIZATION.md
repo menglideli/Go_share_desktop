@@ -38,7 +38,7 @@ M1 三项（P1-1 / P0-2 / P1-6）**全部完成**，M2 首项 **P0-3 也已完�
 > | P2-3 按观众窗口分流 | ⬜ 未做 | 小窗观众收全分辨率；`CtlHello` 已通，可带窗口尺寸 |
 > | P3-1 剪贴板 | ⬜ 未做 | 代码分享刚需，但用户已确认优先"多端一致" |
 > | P3-2 网络质量可视化 | ✅ 已完成（核心） | 观看端计数 → CtlStats → 观众列表 `缺N/补M` + 同步检查日志；HUD 汇总可选 |
-> | P4-1..6 工程/发布 | 🟡 P4-4 已完成 | CI、codec 单测、LICENSE、docs 归位仍未做 |
+> | P4-1..6 工程/发布 | 🟡 P4-4/P4-6/P4-3(许可+CHANGELOG)/P4-2/P4-1 已做 | 仅剩 P4-5 docs 归位（需你定是否公开 PLAN/VERIFY） |
 
 **每次验证的顺序**（今天的教训）：性能类自检（`codeccheck`，尤其是 2K 编码耗时）
 放在 60fps 长跑**之前**跑 —— 持续 60fps 会让这台机器热降频 20 分钟，
@@ -602,7 +602,7 @@ SCTP 不暴露网络丢包，就用"修复频率"作为代理指标，并明确�
 
 | ID | 事项 | 判据 |
 |---|---|---|
-| P4-1 | GitHub Actions：`go vet` + `go test` + `uicheck -golden` + `netcheck` | push 即跑，绿了才算过 |
+| P4-1 | ~~CI~~ 🟡 2026-11-10 已写 `.github/workflows/ci.yml`（build/vet/test/uicheck/netcheck；golden 留本机） | **待 push 后看首次运行**（本地无法执行 Actions） |
 | P4-2 | `internal/codec` 单测：分块切分/往返、覆盖位图、乱序保护、修复轮转 | `go test ./internal/codec` 全绿 |
 | P4-3 | LICENSE + CHANGELOG + GitHub Release 流程 | 🟡 LICENSE（PolyForm Noncommercial 1.0.0，禁商用）+ CHANGELOG 已完成；Release 流程待做 |
 | P4-4 | ~~版本号单一来源~~ ✅ 2026-11-10 | `build.ps1` 用 `-Version` 重写 winres 临时副本；实测 0.7.4 三者一致 |
