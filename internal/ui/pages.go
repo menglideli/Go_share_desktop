@@ -422,17 +422,19 @@ func (s *Shell) pageSetup(gtx layout.Context, th *material.Theme) layout.Dimensi
 								l.Color = colDim
 								rows = append(rows, func(gtx layout.Context) layout.Dimensions { return l.Layout(gtx) })
 							} else {
-								// 内部滚动区：最多 140dp 高，窗口再多也只在这里滚。
-								// 整页高度因此固定，窗口化时「开始分享」不会再被顶出屏幕。
+								// 只显示前 4 个窗口：列表高度固定，窗口化时「开始分享」不会被顶出屏幕。
+								// ⚠️ 不要换成 layout.List —— 实测它在这个嵌套布局里渲染不出按钮，
+								// 而且按钮点不到；直接排 4 行最稳。
+								shown := len(s.windowRows)
+								if shown > 4 {
+									shown = 4
+								}
 								rows = append(rows, func(gtx layout.Context) layout.Dimensions {
-									h := gtx.Dp(unit.Dp(34)) * len(s.windowRows)
-									if maxH := gtx.Dp(unit.Dp(140)); h > maxH {
-										h = maxH
-									}
-									gtx.Constraints = layout.Exact(image.Pt(gtx.Constraints.Max.X, h))
-									return s.winList.Layout(gtx, len(s.windowRows), func(gtx layout.Context, i int) layout.Dimensions {
-										if i >= len(s.winBtns) || i >= len(s.windowRows) {
-											return layout.Dimensions{}
+									kids := make([]layout.FlexChild, 0, shown*2)
+									for i := 0; i < shown; i++ {
+										i := i
+										if i >= len(s.winBtns) {
+											break
 										}
 										label := s.windowRows[i].Title
 										if len([]rune(label)) > 40 {
@@ -441,16 +443,35 @@ func (s *Shell) pageSetup(gtx layout.Context, th *material.Theme) layout.Dimensi
 										if s.winSel == i {
 											label = "✓ " + label
 										}
-										b := material.Button(th, &s.winBtns[i], label)
-										b.Background = colPanel
-										b.Color = colText
-										b.CornerRadius = unit.Dp(6)
-										b.TextSize = unit.Sp(12)
-										b.Inset = layout.UniformInset(unit.Dp(5))
-										gtx.Constraints.Min.X = gtx.Constraints.Max.X
-										return b.Layout(gtx)
-									})
+										// 用 colBG 做底：区块本身是 colPanel，同色按钮会"看不见"（实测）。
+										sel := s.winSel == i
+										bg, fg := colBG, colText
+										if sel {
+											bg = colAccent
+											fg = color.NRGBA{R: 255, G: 255, B: 255, A: 255}
+										}
+										kids = append(kids, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+											b := material.Button(th, &s.winBtns[i], label)
+											b.Background = bg
+											b.Color = fg
+											b.CornerRadius = unit.Dp(6)
+											b.TextSize = unit.Sp(12)
+											b.Inset = layout.UniformInset(unit.Dp(6))
+											gtx.Constraints.Min.X = gtx.Constraints.Max.X
+											return b.Layout(gtx)
+										}))
+										kids = append(kids, layout.Rigid(vSpace(4)))
+									}
+									return layout.Flex{Axis: layout.Vertical}.Layout(gtx, kids...)
 								})
+								if len(s.windowRows) > shown {
+									n := len(s.windowRows) - shown
+									rows = append(rows, func(gtx layout.Context) layout.Dimensions {
+										l := material.Caption(th, fmt.Sprintf("另有 %d 个窗口未显示（可用 -window 指定标题）", n))
+										l.Color = colDim
+										return l.Layout(gtx)
+									})
+								}
 							}
 							rows = append(rows, func(gtx layout.Context) layout.Dimensions {
 								return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
