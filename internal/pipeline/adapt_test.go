@@ -20,31 +20,36 @@ func TestAdaptMaxLevel(t *testing.T) {
 		wantF int
 	}{
 		// 75→67→59→51→43（4 级质量，再降 35<42 停）+ 不限→30→15（2 级帧率）
-		{"最大", PresetMax, 6, 43, 15},
-		// 80→72→64→56→48（4 级，40<42 停）+ 30→15（1 级）
-		{"流畅30", Preset30, 5, 48, 15},
-		// 同最大档质量 4 级 + 60→30→15（2 级）
-		{"流畅60", Preset60, 6, 43, 15},
-		// 65→57→49（2 级，41<42 停）+ 不限→30→15（2 级）
-		{"急速", PresetTurbo, 4, 49, 15},
+		// + 100→67→50（2 级降采样，P1-5）
+		{"最大", PresetMax, 8, 43, 15},
+		// 80→72→64→56→48（4 级，40<42 停）+ 30→15（1 级）+ 2 级降采样
+		{"流畅30", Preset30, 7, 48, 15},
+		// 同最大档质量 4 级 + 60→30→15（2 级）+ 2 级降采样
+		{"流畅60", Preset60, 8, 43, 15},
+		// 65→57→49（2 级，41<42 停）+ 不限→30→15（2 级）+ 2 级降采样
+		{"急速", PresetTurbo, 6, 49, 15},
 	}
 	for _, c := range cases {
 		if got := adaptMaxLevel(c.base); got != c.want {
 			t.Errorf("%s: adaptMaxLevel = %d, 期望 %d", c.name, got, c.want)
 		}
-		q, f := adaptParams(c.base, c.want)
+		q, f, sc := adaptParams(c.base, c.want)
+		// 最低档必然已降分辨率（P1-5）：50% 是阶梯的最后一格。
+		if sc != adaptScaleLow {
+			t.Errorf("%s: 最低档缩放 = %d%%, 期望 %d%%", c.name, sc, adaptScaleLow)
+		}
 		if q != c.wantQ || f != c.wantF {
 			t.Errorf("%s: 顶格参数 = (q%d, f%d), 期望 (q%d, f%d)", c.name, q, f, c.wantQ, c.wantF)
 		}
 		// 超过顶格不许再变（幂等）
-		q2, f2 := adaptParams(c.base, c.want+3)
+		q2, f2, _ := adaptParams(c.base, c.want+3)
 		if q2 != c.wantQ || f2 != c.wantF {
 			t.Errorf("%s: 超顶格参数 = (q%d, f%d), 应保持在 (q%d, f%d)", c.name, q2, f2, c.wantQ, c.wantF)
 		}
 	}
 	// 0 档必须恒等于基准档位（满血）
 	for _, p := range Presets {
-		q, f := adaptParams(p, 0)
+		q, f, _ := adaptParams(p, 0)
 		if q != p.Quality || f != p.MaxFPS {
 			t.Errorf("%s: 0 档参数 = (q%d, f%d), 应等于基准 (q%d, f%d)", p.Name, q, f, p.Quality, p.MaxFPS)
 		}
@@ -66,7 +71,7 @@ func TestAdaptTickDownUp(t *testing.T) {
 	if sh.adapt.level != 1 {
 		t.Fatalf("首次背压后 level = %d, 期望 1", sh.adapt.level)
 	}
-	if q, _ := adaptParams(PresetMax, 1); int(sh.adapt.wantQuality.Load()) != q {
+	if q, _, _ := adaptParams(PresetMax, 1); int(sh.adapt.wantQuality.Load()) != q {
 		t.Fatalf("降档后 wantQuality = %d, 期望 %d", sh.adapt.wantQuality.Load(), q)
 	}
 
@@ -161,7 +166,7 @@ func TestAdaptTickCeilingAndFloor(t *testing.T) {
 		t.Fatalf("持续背压后 level = %d, 期望顶格 %d", sh.adapt.level, sh.adapt.maxLevel)
 	}
 	q, f := int(sh.adapt.wantQuality.Load()), int(sh.adapt.wantMaxFPS.Load())
-	wq, wf := adaptParams(PresetMax, sh.adapt.maxLevel)
+	wq, wf, _ := adaptParams(PresetMax, sh.adapt.maxLevel)
 	if q != wq || f != wf {
 		t.Fatalf("顶格 want = (q%d, f%d), 期望 (q%d, f%d)", q, f, wq, wf)
 	}

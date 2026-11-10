@@ -289,15 +289,19 @@ type adaptCtrl struct {
 	// （编码器非并发安全，只能由 Run 那个 goroutine 碰）。
 	wantQuality atomic.Int64
 	wantMaxFPS  atomic.Int64
+	wantScale   atomic.Int64 // 编码前降采样百分比（P1-5）
 }
 
-// 自适应阶梯参数：质量每档 -8、底线 42；质量到底后限帧 30→15。
+// 自适应阶梯参数：质量每档 -8、底线 42；质量到底后限帧 30→15；
+// 最后一档才降分辨率（100 → 67 → 50）—— 像素少 60%，带宽和编码 CPU 一起降。
 // 42 的底线是实测取的：再低文字边缘明显发虚，不如直接限帧。
 const (
 	adaptQualityStep  = 8
 	adaptQualityFloor = 42
 	adaptFPSMid       = 30
 	adaptFPSLow       = 15
+	adaptScaleMid     = 67 // 2/3
+	adaptScaleLow     = 50 // 1/2
 	// adaptDownCooldown 是连续两次降档的最小间隔：给降档效果一点生效时间，
 	// 避免一秒内从满血连降到底。**首次降档不受它约束** —— 水位都过半了还等 2 秒，
 	// 用户的感受就是"卡住了它才慢慢反应"。
@@ -314,7 +318,7 @@ const (
 // adaptMaxLevel 计算基准档位下可用的降档级数。
 func adaptMaxLevel(base Preset) int {
 	n := 0
-	q, f := base.Quality, base.MaxFPS
+	q, f, sc := base.Quality, base.MaxFPS, 100
 	for {
 		switch {
 		case q-adaptQualityStep >= adaptQualityFloor:
@@ -323,6 +327,10 @@ func adaptMaxLevel(base Preset) int {
 			f = adaptFPSMid
 		case f > adaptFPSLow:
 			f = adaptFPSLow
+		case sc > adaptScaleMid:
+			sc = adaptScaleMid
+		case sc > adaptScaleLow:
+			sc = adaptScaleLow
 		default:
 			return n
 		}
@@ -330,9 +338,10 @@ func adaptMaxLevel(base Preset) int {
 	}
 }
 
-// adaptParams 返回第 level 档对应的（质量, 帧率上限）。0 表示不限帧。
-func adaptParams(base Preset, level int) (quality, maxFPS int) {
-	q, f := base.Quality, base.MaxFPS
+// adaptParams 返回第 level 档对应的（质量, 帧率上限, 降采样百分比）。
+// 0 帧率表示不限帧；100 表示不缩放。
+func adaptParams(base Preset, level int) (quality, maxFPS, scale int) {
+	q, f, sc := base.Quality, base.MaxFPS, 100
 	for i := 0; i < level; i++ {
 		switch {
 		case q-adaptQualityStep >= adaptQualityFloor:
@@ -341,17 +350,22 @@ func adaptParams(base Preset, level int) (quality, maxFPS int) {
 			f = adaptFPSMid
 		case f > adaptFPSLow:
 			f = adaptFPSLow
+		case sc > adaptScaleMid:
+			sc = adaptScaleMid
+		case sc > adaptScaleLow:
+			sc = adaptScaleLow
 		}
 	}
-	return q, f
+	return q, f, sc
 }
 
 // applyAdapt 把当前档位的期望参数写出去（Run 每帧拾取应用）。
 // 调用方必须持 adaptMu。
 func (s *Sharer) applyAdapt(base Preset) {
-	q, f := adaptParams(base, s.adapt.level)
+	q, f, sc := adaptParams(base, s.adapt.level)
 	s.adapt.wantQuality.Store(int64(q))
 	s.adapt.wantMaxFPS.Store(int64(f))
+	s.adapt.wantScale.Store(int64(sc))
 }
 
 // resetAdapt 切换基准档位时调用：回到 0 档并按新基准重算阶梯。
@@ -395,6 +409,17 @@ func (s *Sharer) adaptLoop(ctx context.Context) {
 		}
 		s.adaptTick(drops, wm)
 	}
+}
+
+// scaleShapeFor 按比例返回（缩放后的形状, 该比例）。100% 时原样返回。
+func scaleShapeFor(c rtc.CursorShape, pct int) (rtc.CursorShape, int) {
+	if pct <= 0 || pct >= 100 {
+		return c, 100
+	}
+	if sp, ok := scaleCursor(c, pct); ok {
+		return sp, pct
+	}
+	return c, 100
 }
 
 // scaleCursor 把光标位图按百分比缩小（热点同比）。id 带上比例，
@@ -457,9 +482,9 @@ func (s *Sharer) adaptTick(drops uint64, watermark int) {
 			s.adapt.level++
 			s.adapt.lastDown = time.Now()
 			s.applyAdapt(base)
-			q, f := adaptParams(base, s.adapt.level)
-			log.Printf("pipeline: 自适应降档 %d→%d（背压丢帧 %d/s，缓冲水位 %d%%，质量→%d，fps 上限→%s）",
-				old, s.adapt.level, drops, watermark, q, fpsText(f))
+			q, f, sc := adaptParams(base, s.adapt.level)
+			log.Printf("pipeline: 自适应降档 %d→%d（背压丢帧 %d/s，缓冲水位 %d%%，质量→%d，fps 上限→%s，缩放→%d%%）",
+				old, s.adapt.level, drops, watermark, q, fpsText(f), sc)
 		}
 		return
 	}
@@ -477,9 +502,9 @@ func (s *Sharer) adaptTick(drops uint64, watermark int) {
 		s.adapt.cleanTicks = 0
 		// 注意：不更新 lastDown —— 回升后立刻再遇背压要能马上降回来。
 		s.applyAdapt(base)
-		q, f := adaptParams(base, s.adapt.level)
-		log.Printf("pipeline: 自适应回升 %d→%d（持续无背压，缓冲水位 %d%%，质量→%d，fps 上限→%s）",
-			old, s.adapt.level, watermark, q, fpsText(f))
+		q, f, sc := adaptParams(base, s.adapt.level)
+		log.Printf("pipeline: 自适应回升 %d→%d（持续无背压，缓冲水位 %d%%，质量→%d，fps 上限→%s，缩放→%d%%）",
+			old, s.adapt.level, watermark, q, fpsText(f), sc)
 	}
 }
 
@@ -864,8 +889,10 @@ func (s *Sharer) cursorLoop(ctx context.Context) {
 	const shapeResend = 2 * time.Second
 
 	var (
-		lastHandle  uint64 = ^uint64(0)
-		curShape    rtc.CursorShape
+		lastHandle  uint64          = ^uint64(0)
+		rawShape    rtc.CursorShape // 原始位图（不缩放），比例变化时从它重算
+		curShape    rtc.CursorShape // 按当前比例缩放后的版本（发出去的就是它）
+		shapePct    int             // curShape 是按哪个比例算的
 		haveShape   bool
 		lastShapeAt time.Time
 		lastHidden  bool
@@ -901,17 +928,17 @@ func (s *Sharer) cursorLoop(ctx context.Context) {
 		if vis && h != lastHandle {
 			lastHandle = h
 			if id, w, hh, hotX, hotY, pix, ok := capture.CursorBitmap(); ok && w > 0 && hh > 0 {
-				curShape = rtc.CursorShape{ID: id, W: w, H: hh, HotX: hotX, HotY: hotY, Pix: pix}
-				// P1-5：画面被降采样时，光标位图与热点也要同比缩小，
-				// 否则观看端会把一个"原尺寸"的光标画在缩小的画面上（显得巨大）。
-				if pct > 0 && pct < 100 {
-					if sp, ok := scaleCursor(curShape, pct); ok {
-						curShape = sp
-					}
-				}
+				rawShape = rtc.CursorShape{ID: id, W: w, H: hh, HotX: hotX, HotY: hotY, Pix: pix}
+				curShape, shapePct = scaleShapeFor(rawShape, pct)
 				haveShape = true
 				sendShape(peers) // 形状立刻发；观看端按 id 缓存
 			}
+		}
+		// 比例变化（自适应降分辨率）：同一个形状按新比例重算并立刻重发，
+		// 否则观看端会拿"旧尺寸的光标"画在缩小后的画面上。
+		if haveShape && pct != shapePct {
+			curShape, shapePct = scaleShapeFor(rawShape, pct)
+			sendShape(peers)
 		}
 		// 周期性重发：中途接入的观众端不需要额外的"请求形状"消息。
 		if haveShape && time.Since(lastShapeAt) >= shapeResend {
@@ -1219,6 +1246,10 @@ func (s *Sharer) Run(ctx context.Context) error {
 		}
 		if q := int(s.adapt.wantQuality.Load()); q > 0 && q != s.enc.Config().Quality {
 			s.enc.SetQuality(q)
+		}
+		// P1-5：降采样比例也由自适应控制器给（0 档恒为 100，零成本）。
+		if sc := int(s.adapt.wantScale.Load()); sc > 0 && sc != s.Scale() {
+			s.SetScale(sc)
 		}
 		// 采集源可能正在被重建（换区域/换屏，且帧率需要跟着变）：这期间短暂没有源，
 		// 观众看到的是上一帧（不会黑），等新源就绪即可。
