@@ -432,7 +432,9 @@ func runCase(sk *sink, host, viewer *rtc.Peer, w, h, frames int, dirty bool, pac
 	got, img, avgLat, maxLat, decMS := sk.snapshot()
 	vs := viewer.Stats()
 
-	check(label+" 帧收齐", got == sent,
+	// 允许"收到 > 发送"：调色板/纯色编码让帧变小后，修复轮次的帧不再被邮箱溢出丢掉，
+	// 会正常到达（只多不少）。完整性判据是"不少于发送数"。
+	check(label+" 帧收齐", got >= sent,
 		fmt.Sprintf("发送 %d / 收到 %d 帧（缺失 %d）· 分块 %d · 坏块 %d · 邮箱溢出丢弃 %d",
 			sent, got, sent-got, vs.ChunksRecv, vs.BadChunks, vs.ChunksSkip))
 
@@ -482,7 +484,9 @@ func runFEC(sk *sink, host, viewer *rtc.Peer) {
 		check("FEC 编码", false, err.Error())
 		return
 	}
-	parts := full.Split(codec.MaxChunkPayload)
+	// 用较小的分块上限强制切出 ≥4 块：纯色/调色板编码让这一帧只剩 2~3KB，
+	// 按 60KB 切只有 1 块。FEC 的机制与块大小无关，这里只测"丢一块能恢复"。
+	parts := full.Split(2048)
 	if len(parts) < 4 {
 		check("FEC 分块", false, fmt.Sprintf("只切出 %d 块（<4，不触发 FEC）", len(parts)))
 		return
